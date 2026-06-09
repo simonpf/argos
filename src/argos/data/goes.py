@@ -37,22 +37,22 @@ class GOESObs:
     """
 
     channel_properties = {
-        1: ChannelProperties(47e-6, 0.0, "none"),
-        2: ChannelProperties(64e-6, 0.0, "none"),
-        3: ChannelProperties(86e-6, 0.0, "none"),
-        4: ChannelProperties(1.37e-6, 0.0, "none"),
-        5: ChannelProperties(1.6e-6, 0.0, "none"),
-        6: ChannelProperties(2.2e-6, 0.0, "none"),
-        7: ChannelProperties(3.9e-6, 0.0, "none"),
-        8: ChannelProperties(6.2e-6, 0.0, "none"),
-        9: ChannelProperties(6.9e-6, 0.0, "none"),
-        10: ChannelProperties(7.3e-6, 0.0, "none"),
-        11: ChannelProperties(8.4e-6, 0.0, "none"),
-        12: ChannelProperties(9.6e-6, 0.0, "none"),
-        13: ChannelProperties(10.3e-6, 0.0, "none"),
-        14: ChannelProperties(12.2e-6, 0.0, "none"),
-        15: ChannelProperties(12.3e-6, 0.0, "none"),
-        16: ChannelProperties(13.4e-6, 0.0, "none"),
+        1: ChannelProperties(47e-6, 0.04e-6, 0.0, "none"),
+        2: ChannelProperties(64e-6, 0.10e-6, 0.0, "none"),
+        3: ChannelProperties(86e-6, 0.04e-6, 0.0, "none"),
+        4: ChannelProperties(1.37e-6, 0.03e-6, 0.0, "none"),
+        5: ChannelProperties(1.6e-6, 0.06e-6, 0.0, "none"),
+        6: ChannelProperties(2.2e-6, 0.05e-6, 0.0, "none"),
+        7: ChannelProperties(3.9e-6, 0.2e-6, 0.0, "none"),
+        8: ChannelProperties(6.2e-6, 0.9e-6, 0.0, "none"),
+        9: ChannelProperties(6.9e-6, 0.4e-6, 0.0, "none"),
+        10: ChannelProperties(7.3e-6, 0.2e-6, 0.0, "none"),
+        11: ChannelProperties(8.4e-6, 0.4e-6, 0.0, "none"),
+        12: ChannelProperties(9.6e-6, 0.2e-6, 0.0, "none"),
+        13: ChannelProperties(10.3e-6, 0.5e-6, 0.0, "none"),
+        14: ChannelProperties(11.2e-6, 0.8e-6, 0.0, "none"),
+        15: ChannelProperties(12.3e-6, 1.0e-6, 0.0, "none"),
+        16: ChannelProperties(13.4e-6, 0.6e-6, 0.0, "none"),
     }
     mins = np.array([0.0] * 6  + [150.0] * 10)
 

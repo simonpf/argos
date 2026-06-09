@@ -40,9 +40,10 @@ def pol_to_num(polarization: str) -> int:
 
 @dataclass
 class ChannelProperties:
-    wavelength: float
-    offset: float
-    polarization: str
+    wavelength: float # Wavelength in m
+    bandwidth: float # Bandwidth in m
+    offset: float # The channel offest
+    polarization: str # A string representing the polarization
 
     @property
     def properties(self) -> np.ndarray:
@@ -51,6 +52,7 @@ class ChannelProperties:
         """
         return np.array([
             self.wavelength,
+            self.bandwidth,
             self.offset,
             pol_to_num(self.polarization)
         ])
