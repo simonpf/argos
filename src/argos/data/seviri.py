@@ -207,6 +207,6 @@ seviri_obs = SEVIRIObs(
     product=l1b_msg_seviri,
 )
 seviri_io_obs = SEVIRIObs(
-    name="seviri",
+    name="seviri_io",
     product=l1b_msg_seviri,
 )
