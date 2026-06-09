@@ -37,18 +37,18 @@ class SEVIRIObs:
     """
 
     channel_properties = {
-        "HRV": ChannelProperties(0.7, 0.0, "none"),
-        "VIS006": ChannelProperties(0.63e-6, 0.0, "none"),
-        "VIS008": ChannelProperties(0.81e-6, 0.0, "none"),
-        "IR_016": ChannelProperties(1.63e-6, 0.0, "none"),
-        "IR_039": ChannelProperties(4.0e-6, 0.0, "none"),
-        "WV_062": ChannelProperties(6.25e-6, 0.0, "none"),
-        "WV_073": ChannelProperties(7.35e-6, 0.0, "none"),
-        "IR_087": ChannelProperties(8.7e-6, 0.0, "none"),
-        "IR_097": ChannelProperties(9.66e-6, 0.0, "none"),
-        "IR_108": ChannelProperties(10.8e-6, 0.0, "none"),
-        "IR_120": ChannelProperties(12.0e-6, 0.0, "none"),
-        "IR_134": ChannelProperties(13.4e-6, 0.0, "none"),
+        "HRV": ChannelProperties(0.75e-6, 0.3e-6, 0.0, "none"),
+        "VIS006": ChannelProperties(0.63e-6, 0.15e-6, 0.0, "none"),
+        "VIS008": ChannelProperties(0.81e-6, 0.14e-6, 0.0, "none"),
+        "IR_016": ChannelProperties(1.63e-6, 0.28e-6, "none"),
+        "IR_039": ChannelProperties(4.0e-6, 0.98e-6, "none"),
+        "WV_062": ChannelProperties(6.25e-6, 1.8e-6, "none"),
+        "WV_073": ChannelProperties(7.35e-6, 1.0e-6, "none"),
+        "IR_087": ChannelProperties(8.7e-6, 0.8e-6, 0.0, "none"),
+        "IR_097": ChannelProperties(9.66e-6, 0.56e-6, 0.0, "none"),
+        "IR_108": ChannelProperties(10.8e-6, 2e-6, 0.0, "none"),
+        "IR_120": ChannelProperties(12.0e-6, 2e-6, 0.0, "none"),
+        "IR_134": ChannelProperties(13.4e-6, 2e-6, 0.0, "none"),
     }
 
     mins = np.array([0.0] * 3  + [150.0] * 9)
