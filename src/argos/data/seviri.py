@@ -56,10 +56,10 @@ class SEVIRIObs:
     def __init__(
             self,
             name: str,
-            products: List[pansat.products.Product]
+            product: pansat.products.Product
     ):
         self.name = name
-        self.products = products
+        self.product = product
 
 
     def extract_data(
@@ -94,17 +94,32 @@ class SEVIRIObs:
                 LOGGER.info(
                     f"Loading SEVIRI observations."
                 )
-                data = scene.open(rec)
+                seviri_obs = self.product.open(rec)
                 channels = list(self.channel_properties.keys())
                 for chan_ind, chan in enumerate(channels):
 
-                    data_r = resample_data(data[[chan, "latitude", "longitude"]], grid)
+                    if chan == "HRV":
+                        data_r = resample_data(
+                            seviri_obs[[chan, "latitude_1", "longitude_1"]].rename(
+                                latitude_1="latitude",
+                                longitude_1="longitude",
+                            ),
+                            grid
+                        )
+                    else:
+                        data_r = resample_data(
+                            seviri_obs[[chan, "latitude_0", "longitude_0"]].rename(
+                                latitude_0="latitude",
+                                longitude_0="longitude",
+                            ),
+                            grid
+                        )
 
                     time_range = rec.temporal_coverage
                     output_file = output_path / get_filename(self.name, time_range.start)
                     output_file = output_file.with_suffix(".nc")
 
-                    ch_obs = data_r[channel] - self.mins[chan_ind]
+                    ch_obs = data_r[chan] - self.mins[chan_ind]
                     ch_obs = np.minimum(np.maximum(ch_obs, 0.0), self.mins[chan_ind] + 254.0)
 
                     valid = np.isfinite(ch_obs)
@@ -128,7 +143,7 @@ class SEVIRIObs:
                         data.to_netcdf(output_file)
 
                         LOGGER.info(
-                            f"Writing {channel} to output file '{output_file}'."
+                            f"Writing {chan} channel to output file '{output_file}'."
                         )
 
                     else:
@@ -136,13 +151,13 @@ class SEVIRIObs:
                         lons = lons[0]
                         lats = lats[:, 0]
 
-                        obs = np.zeros((16,) + data_r[channel].data.shape)
+                        obs = np.zeros((12,) + data_r[chan].data.shape)
                         obs[chan_ind, :, :] = ch_obs
 
-                        obs_min = np.zeros(16,)
-                        obs_max = np.zeros(16,)
-                        obs_sum = np.zeros(16,)
-                        obs_cts = np.zeros(16,)
+                        obs_min = np.zeros(12,)
+                        obs_max = np.zeros(12,)
+                        obs_sum = np.zeros(12,)
+                        obs_cts = np.zeros(12,)
 
                         ch_obs = ch_obs[valid]
                         obs_min[chan_ind] = ch_obs.min()
@@ -151,7 +166,7 @@ class SEVIRIObs:
                         obs_cts[chan_ind] = valid.sum()
 
                         channel_props = np.stack([
-                            self.channel_properties[ind].properties for ind in range(1, 17)
+                            self.channel_properties[chan].properties for chan in channels
                         ])
 
                         data_r = xr.Dataset({
@@ -172,7 +187,7 @@ class SEVIRIObs:
                             "zlib": True,
                             "complevel": 6,
                             "scale_factor": 1.0,
-                            "chunksizes": (16, 512, 512)
+                            "chunksizes": (12, 512, 512)
                         }
                         data_r.availability.encoding = {
                             "dtype": "int8",
@@ -180,12 +195,11 @@ class SEVIRIObs:
                             "shuffle":  True
                         }
                         LOGGER.info(
-                            f"Writing {channel} to output file '{output_file}'."
+                            f"Writing {chan} to output file '{output_file}'."
                         )
                         data_r.to_netcdf(output_file)
 
                 time = time + step
-                break
 
 
 seviri_obs = SEVIRIObs(
