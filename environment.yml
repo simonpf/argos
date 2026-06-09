@@ -1,0 +1,27 @@
+name: argos
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.13
+  - numpy>=1.20.0
+  - scipy>=1.7.0
+  - pandas>=1.3.0
+  - scikit-learn>=1.0.0
+  - matplotlib>=3.4.0
+  - xarray>=0.19.0
+  - netcdf4>=1.5.0
+  - cartopy
+  - pyresample
+  - satpy
+  - hdf5
+  - pip
+  - pip:
+    - pytest>=6.0
+    - pytest-cov>=2.0
+    - black>=22.0
+    - flake8>=4.0
+    - isort>=5.0
+    - mypy>=0.900
+    - git+https://github.com/see-geo/pansat@refactoring
+    - jupyterlab
