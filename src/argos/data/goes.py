@@ -195,7 +195,6 @@ class GOESObs:
                         data_r.to_netcdf(output_file)
 
             time = time + step
-            break
 
 
 goes_16_obs = GOESObs(
