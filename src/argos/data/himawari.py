@@ -12,14 +12,15 @@ from typing import List
 import numpy as np
 import pansat
 from pansat.time import TimeRange
-from pansat.utils import resample_data
+from pansat.utils import resample_data, get_resample_info
 from pansat.products.satellite.himawari import (
     l1b_himawari8_all,
     l1b_himawari9_all
 )
 from satpy import Scene
-
 import xarray as xr
+import zarr
+from numcodecs.zarr3 import Blosc
 
 from argos.grids import get_default_grid
 from argos.utils import get_filename
@@ -93,6 +94,9 @@ class HimawariObs:
         time = start_time
         while time < end_time:
             recs = self.product.get(TimeRange(time + np.timedelta64(5, "m")))
+            
+            info = None
+            
             for band in range(1, 17):
                 band_recs = [rec for rec in recs if f"B{band:02}" in rec.filename]
                 scene = Scene([str(rec.local_path) for rec in band_recs])
@@ -109,14 +113,16 @@ class HimawariObs:
                 data[channel] = data[channel].astype(np.float32)
                 data["longitude"] = (("y", "x"), lons.astype(np.float32))
                 data["latitude"] = (("y", "x"), lats.astype(np.float32))
-                data_r = resample_data(data, grid)
+                
+                if info is None:
+                    info = get_resample_info(data, grid)
+                data_r = resample_data(data, grid, info=info)
 
                 time_range = band_recs[0].temporal_coverage
                 output_file = output_path / get_filename(self.name, time_range.start)
-                output_file = output_file.with_suffix(".nc")
+                output_file = output_file.with_suffix(".zarr")
 
-                ch_obs = data_r[channel] - self.mins[chan_ind]
-                ch_obs = np.minimum(np.maximum(ch_obs, 0.0), self.mins[chan_ind] + 254.0)
+                ch_obs = data_r[channel]
 
                 valid = np.isfinite(ch_obs)
                 availability = valid.coarsen(longitude=80, latitude=80).sum()
@@ -126,74 +132,137 @@ class HimawariObs:
                 availability = availability.data
                 ch_obs[~valid] = np.nan
 
+                # Apply scaling using mins array and convert to uint8
+                ch_obs_scaled = ch_obs - self.mins[chan_ind]
+                ch_obs_scaled = np.maximum(ch_obs_scaled, 0.0)  # Ensure non-negative
+                ch_obs_uint8 = np.minimum(ch_obs_scaled, 254.0).astype(np.uint8)
+                ch_obs_uint8[~valid] = 255  # Use 255 as NaN value
+
                 if output_file.exists():
-                    data = xr.load_dataset(output_file)
-                    data.obs.data[chan_ind, :, :] = ch_obs
-
-                    ch_obs = ch_obs[valid]
-                    data.obs_min.data[chan_ind] = ch_obs.min()
-                    data.obs_max.data[chan_ind] = ch_obs.max()
-                    data.obs_sum.data[chan_ind] = ch_obs.sum()
-                    data.obs_cts.data[chan_ind] = valid.sum()
-                    data.availability.data[:] = 0 < (data.availability.data + availability)
-                    data.to_netcdf(output_file)
-
+                    # Open existing zarr store and update the channel
+                    store = zarr.open_group(str(output_file), mode='r+')
+                    
+                    # Update observations for this channel
+                    store['obs'][chan_ind, :, :] = ch_obs_uint8
+                    
+                    # Update statistics for this channel (use original float values)
+                    ch_obs_valid = ch_obs[valid]
+                    if len(ch_obs_valid) > 0:
+                        store['obs_min'][chan_ind] = ch_obs_valid.min()
+                        store['obs_max'][chan_ind] = ch_obs_valid.max()
+                        store['obs_sum'][chan_ind] = ch_obs_valid.sum()
+                        store['obs_cts'][chan_ind] = valid.sum()
+                    
+                    # Update availability (combine with existing)
+                    existing_availability = store['availability'][:]
+                    store['availability'][:] = 0 < (existing_availability + availability)
+                    
                     LOGGER.info(
-                        f"Writing {channel} to output file '{output_file}'."
+                        f"Updated {channel} in zarr file '{output_file}'."
                     )
 
                 else:
+                    # Create new zarr store using low-level operations
                     lons, lats = grid.get_lonlats()
                     lons = lons[0]
                     lats = lats[:, 0]
 
-                    obs = np.zeros((16,) + data_r[channel].data.shape)
-                    obs[chan_ind, :, :] = ch_obs
-
-                    obs_min = np.zeros(16,)
-                    obs_max = np.zeros(16,)
-                    obs_sum = np.zeros(16,)
-                    obs_cts = np.zeros(16,)
-
-                    ch_obs = ch_obs[valid]
-                    obs_min[chan_ind] = ch_obs.min()
-                    obs_max[chan_ind] = ch_obs.max()
-                    obs_sum[chan_ind] = ch_obs.sum()
-                    obs_cts[chan_ind] = valid.sum()
-
-                    channel_props = np.stack([
-                        self.channel_properties[f"C{ind:02}"].properties for ind in range(1, 17)
-                    ])
-
-                    data_r = xr.Dataset({
-                        "time": np.datetime64(time_range.start),
-                        "longitude": (("longitude",), lons),
-                        "latitude": (("latitude",), lats),
-                        "obs": (("channel", "latitude", "longitude"), obs),
-                        "obs_min": (("channel",), obs_min),
-                        "obs_max": (("channel",), obs_max),
-                        "obs_sum": (("channel",), obs_sum),
-                        "obs_cts": (("channel",), obs_cts),
-                        "availability": (("latitude_80", "longitude_80"), 0 < availability),
-                        "channel_properties": (("channel", "channel_features"), channel_props)
-                    })
-                    data_r.obs.encoding = {
-                        "dtype": "uint8",
-                        "_FillValue": 255,
-                        "zlib": True,
-                        "complevel": 6,
-                        "scale_factor": 1.0,
-                        "chunksizes": (16, 512, 512)
-                    }
-                    data_r.availability.encoding = {
-                        "dtype": "int8",
-                        "zlib": True,
-                        "shuffle":  True
-                    }
-                    LOGGER.info(
-                        f"Writing {channel} to output file '{output_file}'."
+                    # Get shape from current channel data
+                    channel_shape = data_r[channel].data.shape
+                    obs_shape = (16,) + channel_shape  # 16 channels for Himawari
+                    
+                    # Create zarr group
+                    store = zarr.open_group(str(output_file), mode='w')
+                    store.attrs["fill_value"] = 255
+                    store.attrs["offsets"] = list(self.mins)
+                    
+                    # Store coordinate arrays
+                    store.create_array(
+                        'time',
+                        data=np.datetime64(time_range.start),
+                        dimension_names=None
                     )
-                    data_r.to_netcdf(output_file)
+                    store.create_array(
+                        'longitude',
+                        data=lons.astype(np.float32),
+                        dimension_names=("longitude",),
+                    )
+                    store.create_array(
+                        'latitude',
+                        data=lats.astype(np.float32),
+                        dimension_names=("latitude",),
+                    )
+                    
+                    # Create observation array without initializing data (lazy allocation)
+                    store.create_array(
+                        'obs',
+                        shape=obs_shape,
+                        chunks=(1, min(512, channel_shape[0]), min(512, channel_shape[1])),
+                        dtype=np.uint8,
+                        fill_value=255,
+                        compressors=Blosc(cname='zstd', clevel=4),
+                        dimension_names=("channel", "latitude", "longitude"),
+                    )
+                    
+                    # Create statistics arrays
+                    dims = ("channel",)
+                    store.create_array(
+                        'obs_min',
+                        shape=(16,),
+                        dtype=np.float32,
+                        fill_value=np.nan,
+                        dimension_names=dims
+                    )
+                    store.create_array(
+                        'obs_max',
+                        shape=(16,),
+                        dtype=np.float32,
+                        fill_value=np.nan,
+                        dimension_names=dims
+                    )
+                    store.create_array(
+                        'obs_sum',
+                        shape=(16,),
+                        dtype=np.float32,
+                        fill_value=np.nan,
+                        dimension_names=dims
+                    )
+                    store.create_array(
+                        'obs_cts',
+                        shape=(16,),
+                        dtype=np.int32,
+                        fill_value=0,
+                        dimension_names=dims
+                    )
+                    
+                    # Store availability
+                    store.create_array(
+                        'availability',
+                        data=(0 < availability).astype(np.int8),
+                        compressor=Blosc(cname='zstd', clevel=4),
+                        dimension_names=("latitude_80", "longitude_80")
+                    )
+                    
+                    # Store channel properties
+                    channel_props = np.stack([
+                        self.channel_properties[f"C{ind:02d}"].properties for ind in range(1, 17)
+                    ])
+                    store.create_array('channel_properties', data=channel_props, dimension_names=("channel", "feature"))
+                    
+                    # Now write the current channel data
+                    store['obs'][chan_ind, :, :] = ch_obs_uint8
+                    
+                    # Update statistics for this channel (use original float values)
+                    ch_obs_valid = ch_obs[valid]
+                    if len(ch_obs_valid) > 0:
+                        store['obs_min'][chan_ind] = ch_obs_valid.min()
+                        store['obs_max'][chan_ind] = ch_obs_valid.max()
+                        store['obs_sum'][chan_ind] = ch_obs_valid.sum()
+                        store['obs_cts'][chan_ind] = valid.sum()
+                    
+                    LOGGER.info(
+                        f"Created new zarr file '{output_file}' with {channel}."
+                    )
 
             time = time + step
 
