@@ -98,6 +98,7 @@ class GOESObs:
                 prod.get(TimeRange(time, time + np.timedelta64(5, "m")))[0] for prod in self.products
             ]
             scene = Scene([rec.local_path for rec in recs], reader="abi_l1b")
+
             datasets = scene.available_dataset_names()
             scene.load(datasets)
 
@@ -187,8 +188,8 @@ class GOESObs:
                     else:
                         # Create new zarr store using low-level operations
                         lons_g, lats_g = grid.get_lonlats()
-                        lons_g = lons[0]
-                        lats_g = lats[:, 0]
+                        lons_g = lons_g[0]
+                        lats_g = lats_g[:, 0]
 
                         # Get shape from current channel data
                         channel_shape = data_r[channel].data.shape
