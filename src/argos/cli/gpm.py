@@ -17,8 +17,19 @@ import numpy as np
 from argos.data.gpm import (
     gpm_gmi_obs,
     gpm_gmi_ref,
-    gpm_amsr2_ref
-    )
+    gpm_amsr2_ref,
+    f16_ssmis_obs,
+    f17_ssmis_obs,
+    f18_ssmis_obs,
+    f19_ssmis_obs,
+    npp_atms_obs,
+    noaa18_mhs_obs,
+    noaa19_mhs_obs,
+    metopa_mhs_obs,
+    metopb_mhs_obs,
+    metopc_mhs_obs,
+    noaa20_atms_obs,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -26,6 +37,17 @@ LOGGER = logging.getLogger(__name__)
 
 SENSORS = {
     'gpm_gmi': gpm_gmi_obs,
+    'f16_ssmis': f16_ssmis_obs,
+    'f17_ssmis': f17_ssmis_obs,
+    'f18_ssmis': f18_ssmis_obs,
+    'f19_ssmis': f19_ssmis_obs,
+    'npp_atms': npp_atms_obs,
+    'noaa18_mhs': noaa18_mhs_obs,
+    'noaa19_mhs': noaa19_mhs_obs,
+    'metopa_mhs_obs': metopa_mhs_obs,
+    'metopb_mhs_obs': metopb_mhs_obs,
+    'metopc_mhs_obs': metopc_mhs_obs,
+    'noaa20_atms': noaa20_atms_obs,
     'gprof_gmi': gpm_gmi_ref,
     'gprof_amsr2': gpm_amsr2_ref,
 }

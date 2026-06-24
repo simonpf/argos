@@ -20,6 +20,18 @@ from pansat.products.satellite.gpm import (
     l1c_xcal2016v_gcomw1_amsr2_v07a,
     l1c_xcal2019v_noaa20_atms_v07a,
     l1c_xcal2019v_npp_atms_v07a,
+    l1c_xcal2016v_noaa18_mhs_v07a,
+    l1c_xcal2016v_noaa19_mhs_v07a,
+    l1c_xcal2021v_metopa_mhs_v07a,
+    l1c_xcal2016v_metopb_mhs_v07a,
+    l1c_xcal2019v_metopc_mhs_v07a,
+    l1c_xcal2021v_f16_ssmis_v07a,
+    l1c_xcal2021v_f16_ssmis_v07b,
+    l1c_xcal2021v_f17_ssmis_v07a,
+    l1c_xcal2021v_f17_ssmis_v07b,
+    l1c_xcal2021v_f18_ssmis_v07a,
+    l1c_xcal2021v_f18_ssmis_v07b,
+    l1c_xcal2021v_f19_ssmis_v07a,
     l2a_gprof_gpm_gmi_v08a,
     l2a_gprof_gcomw1_amsr2_v08a
 )
@@ -370,20 +382,162 @@ gpm_gmi_obs = GPMObs(
     }
 )
 
-#gcomw1_amsr2_obs = GPMObs(
-#    name="gcomw1_amsr2",
-#    products=[l1c_xcal2016v_gcomw1_amsr2_v07a]
-#)
-#
-#noaa20_atms_obs = GPMObs(
-#    name="noaa20_atms",
-#    products=[l1c_xcal2019v_noaa20_atms_v07a]
-#)
-#
-#npp_atms_obs = GPMObs(
-#    name="npp_atms",
-#    products=[l1c_xcal2019v_npp_atms_v07a]
-#)
+# Channel properties are keyed by (swath_index, channel_index) following the GPM
+# L1C swath layout. Values (center frequency [GHz], bandwidth [MHz], offset [GHz]
+# and polarization) are taken from the sensor spec sheets in `specs/`. Cross-track
+# sounders (MHS, ATMS) use quasi-polarization (QV/QH); conically scanning imagers
+# (AMSR2, SSMIS) use V/H.
+
+# MHS: single cross-track swath with 5 channels.
+_MHS_CHANNEL_PROPERTIES = {
+    (1, 0): MWChannelProperties(89.00, 2800.0, 0.0, "QV"),
+    (1, 1): MWChannelProperties(157.00, 2800.0, 0.0, "QV"),
+    (1, 2): MWChannelProperties(183.31, 1000.0, 1.0, "QH"),
+    (1, 3): MWChannelProperties(183.31, 2000.0, 3.0, "QH"),
+    (1, 4): MWChannelProperties(190.31, 2200.0, 0.0, "QV"),
+}
+
+noaa18_mhs_obs = GPMObs(
+    name="noaa18_mhs",
+    products=[l1c_xcal2016v_noaa18_mhs_v07a],
+    radius_of_influence=30e3,
+    channel_properties=_MHS_CHANNEL_PROPERTIES,
+)
+
+noaa19_mhs_obs = GPMObs(
+    name="noaa19_mhs",
+    products=[l1c_xcal2016v_noaa19_mhs_v07a],
+    radius_of_influence=30e3,
+    channel_properties=_MHS_CHANNEL_PROPERTIES,
+)
+
+metopa_mhs_obs = GPMObs(
+    name="metopa_mhs",
+    products=[l1c_xcal2021v_metopa_mhs_v07a],
+    radius_of_influence=30e3,
+    channel_properties=_MHS_CHANNEL_PROPERTIES,
+)
+
+metopb_mhs_obs = GPMObs(
+    name="metopb_mhs",
+    products=[l1c_xcal2016v_metopb_mhs_v07a],
+    radius_of_influence=30e3,
+    channel_properties=_MHS_CHANNEL_PROPERTIES,
+)
+
+metopc_mhs_obs = GPMObs(
+    name="metopc_mhs",
+    products=[l1c_xcal2019v_metopc_mhs_v07a],
+    radius_of_influence=30e3,
+    channel_properties=_MHS_CHANNEL_PROPERTIES,
+)
+
+# ATMS: window channels (S1), 88.2 GHz (S2) and the 165/183 GHz sounding
+# channels (S3).
+_ATMS_CHANNEL_PROPERTIES = {
+    (1, 0): MWChannelProperties(23.80, 270.0, 0.0, "QV"),
+    (2, 1): MWChannelProperties(31.40, 180.0, 0.0, "QV"),
+    (3, 0): MWChannelProperties(88.20, 2000.0, 0.0, "QV"),
+    (4, 0): MWChannelProperties(165.50, 3000.0, 0.0, "QH"),
+    (4, 1): MWChannelProperties(183.31, 2000.0, 7.0, "QH"),
+    (4, 2): MWChannelProperties(183.31, 2000.0, 4.5, "QH"),
+    (4, 3): MWChannelProperties(183.31, 1000.0, 3.0, "QH"),
+    (4, 4): MWChannelProperties(183.31, 1000.0, 1.8, "QH"),
+    (4, 5): MWChannelProperties(183.31, 500.0, 1.0, "QH"),
+}
+
+noaa20_atms_obs = GPMObs(
+    name="noaa20_atms",
+    products=[l1c_xcal2019v_noaa20_atms_v07a],
+    radius_of_influence=30e3,
+    channel_properties=_ATMS_CHANNEL_PROPERTIES,
+)
+
+npp_atms_obs = GPMObs(
+    name="npp_atms",
+    products=[l1c_xcal2019v_npp_atms_v07a],
+    radius_of_influence=30e3,
+    channel_properties=_ATMS_CHANNEL_PROPERTIES,
+)
+
+# AMSR2: one swath per frequency (V/H), with the 89 GHz A- and B-scans as
+# separate swaths.
+_AMSR2_CHANNEL_PROPERTIES = {
+    (1, 0): MWChannelProperties(10.65, 100.0, 0.0, "V"),
+    (1, 1): MWChannelProperties(10.65, 100.0, 0.0, "H"),
+    (2, 0): MWChannelProperties(18.70, 200.0, 0.0, "V"),
+    (2, 1): MWChannelProperties(18.70, 200.0, 0.0, "H"),
+    (3, 0): MWChannelProperties(23.80, 400.0, 0.0, "V"),
+    (3, 1): MWChannelProperties(23.80, 400.0, 0.0, "H"),
+    (4, 0): MWChannelProperties(36.50, 1000.0, 0.0, "V"),
+    (4, 1): MWChannelProperties(36.50, 1000.0, 0.0, "H"),
+    (5, 0): MWChannelProperties(89.00, 3000.0, 0.0, "V"),
+    (5, 1): MWChannelProperties(89.00, 3000.0, 0.0, "H"),
+    (6, 0): MWChannelProperties(89.00, 3000.0, 0.0, "V"),
+    (6, 1): MWChannelProperties(89.00, 3000.0, 0.0, "H"),
+}
+
+gcomw1_amsr2_obs = GPMObs(
+    name="gcomw1_amsr2",
+    products=[l1c_xcal2016v_gcomw1_amsr2_v07a],
+    radius_of_influence=15e3,
+    channel_properties=_AMSR2_CHANNEL_PROPERTIES,
+)
+
+# SSMIS: low-frequency imaging channels (S1), 91 GHz (S2) and the 150/183 GHz
+# sounding channels (S3).
+_SSMIS_CHANNEL_PROPERTIES = {
+    (1, 0): MWChannelProperties(19.35, 400.0, 0.0, "V"),
+    (1, 1): MWChannelProperties(19.35, 400.0, 0.0, "H"),
+    (1, 2): MWChannelProperties(22.235, 450.0, 0.0, "V"),
+    (2, 0): MWChannelProperties(37.00, 1500.0, 0.0, "V"),
+    (2, 1): MWChannelProperties(37.00, 1500.0, 0.0, "H"),
+    (3, 0): MWChannelProperties(150.00, 1500.0, 0.0, "H"),
+    (3, 1): MWChannelProperties(183.31, 1500.0, 6.6, "H"),
+    (3, 2): MWChannelProperties(183.31, 1000.0, 3.0, "H"),
+    (3, 3): MWChannelProperties(183.31, 500.0, 1.0, "H"),
+    (4, 0): MWChannelProperties(91.655, 1500.0, 0.0, "V"),
+    (4, 1): MWChannelProperties(91.655, 1500.0, 0.0, "H"),
+}
+
+f16_ssmis_obs = GPMObs(
+    name="f16_ssmis",
+    products=[
+        l1c_xcal2021v_f16_ssmis_v07a,
+        l1c_xcal2021v_f16_ssmis_v07b,
+    ],
+    radius_of_influence=30e3,
+    channel_properties=_SSMIS_CHANNEL_PROPERTIES,
+)
+
+f17_ssmis_obs = GPMObs(
+    name="f17_ssmis",
+    products=[
+        l1c_xcal2021v_f17_ssmis_v07a,
+        l1c_xcal2021v_f17_ssmis_v07b,
+    ],
+    radius_of_influence=30e3,
+    channel_properties=_SSMIS_CHANNEL_PROPERTIES,
+)
+
+f18_ssmis_obs = GPMObs(
+    name="f18_ssmis",
+    products=[
+        l1c_xcal2021v_f17_ssmis_v07a,
+        l1c_xcal2021v_f17_ssmis_v07b,
+    ],
+    radius_of_influence=30e3,
+    channel_properties=_SSMIS_CHANNEL_PROPERTIES,
+)
+
+f19_ssmis_obs = GPMObs(
+    name="f19_ssmis",
+    products=[
+        l1c_xcal2021v_f19_ssmis_v07a,
+    ],
+    radius_of_influence=30e3,
+    channel_properties=_SSMIS_CHANNEL_PROPERTIES,
+)
 
 
 
