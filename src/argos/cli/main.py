@@ -9,6 +9,7 @@ import click
 from argos.cli.goes import goes
 from argos.cli.seviri import seviri
 from argos.cli.himawari import himawari
+from argos.cli.gpm import gpm
 
 
 @click.group()
@@ -24,6 +25,7 @@ def main():
 main.add_command(goes)
 main.add_command(seviri)
 main.add_command(himawari)
+main.add_command(gpm)
 
 
 if __name__ == "__main__":
