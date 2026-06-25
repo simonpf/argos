@@ -436,7 +436,7 @@ metopc_mhs_obs = GPMObs(
 # channels (S3).
 _ATMS_CHANNEL_PROPERTIES = {
     (1, 0): MWChannelProperties(23.80, 270.0, 0.0, "QV"),
-    (2, 1): MWChannelProperties(31.40, 180.0, 0.0, "QV"),
+    (2, 0): MWChannelProperties(31.40, 180.0, 0.0, "QV"),
     (3, 0): MWChannelProperties(88.20, 2000.0, 0.0, "QV"),
     (4, 0): MWChannelProperties(165.50, 3000.0, 0.0, "QH"),
     (4, 1): MWChannelProperties(183.31, 2000.0, 7.0, "QH"),
@@ -538,8 +538,6 @@ f19_ssmis_obs = GPMObs(
     radius_of_influence=30e3,
     channel_properties=_SSMIS_CHANNEL_PROPERTIES,
 )
-
-
 
 
 class GPMRefData:
