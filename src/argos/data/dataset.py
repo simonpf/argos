@@ -1016,7 +1016,9 @@ class ArgosTrainingData(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index: int) -> Dict[str, object]:
+    def __getitem__(
+        self, index: int
+    ) -> Tuple[Dict[str, object], torch.Tensor]:
         sample = self.samples[index]
         row_c, col_c = sample["coordinates"]
         latitude, longitude = self._reference_grid
@@ -1057,14 +1059,13 @@ class ArgosTrainingData(Dataset):
             else:
                 obs[sensor] = torch.from_numpy(array)
 
-        # Reference surface precipitation.
+        # Reference surface precipitation (the target).
         surface_precip = self._load_reference(
             sample["reference"], ref_r0, ref_c0, self.tile_size
         )
 
-        return {
+        inputs = {
             "obs": obs,
-            "surface_precip": torch.from_numpy(surface_precip),
             "coordinates": (int(row_c), int(col_c)),
             "latitude": torch.from_numpy(
                 latitude[ref_r0 : ref_r0 + self.tile_size].copy()
@@ -1073,6 +1074,7 @@ class ArgosTrainingData(Dataset):
                 longitude[ref_c0 : ref_c0 + self.tile_size].copy()
             ),
         }
+        return inputs, torch.from_numpy(surface_precip)
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -1163,7 +1165,7 @@ PRECIP_LEVELS = (0.1, 1.0, 10.0)
 PRECIP_LINESTYLES = (":", "--", "-")
 
 
-def plot_sample(sample: Dict[str, object], n_channels: int = 3, rng=None):
+def plot_sample(sample: Tuple[Dict[str, object], object], n_channels: int = 3, rng=None):
     """
     Plot a sample with one row of input channels per sensor.
 
@@ -1173,10 +1175,11 @@ def plot_sample(sample: Dict[str, object], n_channels: int = 3, rng=None):
     respectively.
 
     Args:
-        sample: A sample as returned by ``ArgosTrainingData.__getitem__``, i.e. a
-            dictionary with an ``"obs"`` mapping of sensor name to observation
-            tensor, a ``"surface_precip"`` tensor and ``"latitude"`` /
-            ``"longitude"`` coordinate tensors.
+        sample: An ``(inputs, target)`` tuple as returned by
+            ``ArgosTrainingData.__getitem__`` -- ``inputs`` holding an ``"obs"``
+            mapping of sensor name to observation tensor and ``"latitude"`` /
+            ``"longitude"`` coordinate tensors, and ``target`` the surface
+            precipitation tensor.
         n_channels: The number of channels to show per input sensor.
         rng: Optional seed or ``numpy.random.Generator`` controlling the random
             channel selection.
@@ -1188,11 +1191,12 @@ def plot_sample(sample: Dict[str, object], n_channels: int = 3, rng=None):
 
     rng = np.random.default_rng(rng)
 
-    obs = sample["obs"]
+    inputs, target = sample
+    obs = inputs["obs"]
     sensors = list(obs)
-    precip = np.asarray(sample["surface_precip"])
-    lat = np.asarray(sample["latitude"])
-    lon = np.asarray(sample["longitude"])
+    precip = np.asarray(target)
+    lat = np.asarray(inputs["latitude"])
+    lon = np.asarray(inputs["longitude"])
     extent = [float(lon.min()), float(lon.max()), float(lat.min()), float(lat.max())]
     lon_grid, lat_grid = np.meshgrid(lon, lat)
 
