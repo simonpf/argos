@@ -19,7 +19,7 @@ output is at the resolution of the microwave (reference) data, i.e.
 Either input may be omitted (``None``) for a whole batch; missing channels within
 an otherwise present input should be encoded as ``NaN`` and are treated as zeros.
 """
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Union
 
 from pytorch_retrieve.tensors.quantile_tensor import QuantileTensor
 import torch
@@ -126,6 +126,10 @@ class ResNeXtUNet(nn.Module):
         cardinality: Number of groups in the ResNeXt blocks.
         geo_downsample: Factor by which the geostationary input is downsampled to
             reach the microwave/reference resolution.
+        blocks_per_stage: Number of ResNeXt blocks in each encoder stage. Either
+            an ``int`` (same for every stage) or a sequence of length ``depth``
+            (one entry per stage, from finest to coarsest). Defaults to
+            ``(1, 2, ..., depth)``, i.e. more blocks at the coarser stages.
     """
 
     def __init__(
@@ -137,12 +141,27 @@ class ResNeXtUNet(nn.Module):
         depth: int = 3,
         cardinality: int = 8,
         geo_downsample: int = RESOLUTION_RATIO,
+        blocks_per_stage: Optional[Union[int, Sequence[int]]] = None,
     ):
         super().__init__()
         self.geo_channels = geo_channels
         self.mw_channels = mw_channels
         self.base_channels = base_channels
         self.geo_downsample = geo_downsample
+
+        # Number of blocks in each (increasingly coarse) encoder stage.
+        if blocks_per_stage is None:
+            stage_blocks = list(range(1, depth + 1))
+        elif isinstance(blocks_per_stage, int):
+            stage_blocks = [blocks_per_stage] * depth
+        else:
+            stage_blocks = list(blocks_per_stage)
+            if len(stage_blocks) != depth:
+                raise ValueError(
+                    f"blocks_per_stage must have length depth ({depth}), got "
+                    f"{len(stage_blocks)}."
+                )
+        self.blocks_per_stage = stage_blocks
 
         channels = base_channels
 
@@ -166,29 +185,53 @@ class ResNeXtUNet(nn.Module):
         self.fuse = ResNeXtBlock(2 * channels, channels, cardinality)
 
         # Encoder: ``depth`` downsampling stages, doubling the channels each time.
+        # Each stage downsamples with its first block and then stacks
+        # ``stage_blocks`` blocks at the (coarser) stage resolution.
         self.encoder = nn.ModuleList()
         skip_channels = [channels]
-        for _ in range(depth):
+        for n_blocks in stage_blocks:
             self.encoder.append(
-                ResNeXtBlock(channels, channels * 2, cardinality, stride=2)
+                self._make_stage(
+                    channels, channels * 2, n_blocks, cardinality, stride=2
+                )
             )
             channels *= 2
             skip_channels.append(channels)
 
-        # Decoder: ``depth`` upsampling stages with skip connections.
+        # Decoder: ``depth`` upsampling stages with skip connections, mirroring the
+        # encoder so that each stage has the same number of blocks as the encoder
+        # stage at the matching resolution (reversed order).
         self.upsamplers = nn.ModuleList()
         self.decoder = nn.ModuleList()
-        for stage in range(depth):
+        for stage, n_blocks in enumerate(reversed(stage_blocks)):
             self.upsamplers.append(
                 nn.Conv2d(channels, channels // 2, 1, bias=False)
             )
             skip = skip_channels[depth - 1 - stage]
             self.decoder.append(
-                ResNeXtBlock(channels // 2 + skip, channels // 2, cardinality)
+                self._make_stage(
+                    channels // 2 + skip, channels // 2, n_blocks, cardinality
+                )
             )
             channels //= 2
 
         self.head = nn.Conv2d(channels, out_channels, 1)
+
+    @staticmethod
+    def _make_stage(
+        in_channels: int,
+        out_channels: int,
+        n_blocks: int,
+        cardinality: int,
+        stride: int = 1,
+    ) -> nn.Sequential:
+        """A (possibly strided) ResNeXt block followed by ``n_blocks - 1`` blocks."""
+        blocks = [ResNeXtBlock(in_channels, out_channels, cardinality, stride=stride)]
+        blocks += [
+            ResNeXtBlock(out_channels, out_channels, cardinality)
+            for _ in range(n_blocks - 1)
+        ]
+        return nn.Sequential(*blocks)
 
     def forward(
         self,
