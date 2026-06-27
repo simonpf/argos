@@ -19,8 +19,9 @@ output is at the resolution of the microwave (reference) data, i.e.
 Either input may be omitted (``None``) for a whole batch; missing channels within
 an otherwise present input should be encoded as ``NaN`` and are treated as zeros.
 """
-from typing import List, Optional
+from typing import Dict, List, Optional
 
+from pytorch_retrieve.tensors.quantile_tensor import QuantileTensor
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -29,6 +30,40 @@ from argos.data.dataset import N_MW_SLOTS, N_SLOTS, RESOLUTION_RATIO
 
 __all__ = ["ResNeXtBlock", "ResNeXtUNet"]
 
+quantiles = [
+    0.01,
+    0.03225806,
+    0.06451613,
+    0.09677419,
+    0.12903226,
+    0.16129032,
+    0.19354839,
+    0.22580645,
+    0.25806452,
+    0.29032258,
+    0.32258065,
+    0.35483871,
+    0.38709677,
+    0.41935484,
+    0.4516129 ,
+    0.48387097,
+    0.51612903,
+    0.5483871 ,
+    0.58064516,
+    0.61290323,
+    0.64516129,
+    0.67741935,
+    0.70967742,
+    0.74193548,
+    0.77419355,
+    0.80645161,
+    0.83870968,
+    0.87096774,
+    0.90322581,
+    0.93548387,
+    0.96774194,
+    0.99
+]
 
 class ResNeXtBlock(nn.Module):
     """
@@ -40,11 +75,11 @@ class ResNeXtBlock(nn.Module):
     """
 
     def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        cardinality: int = 8,
-        stride: int = 1,
+            self,
+            in_channels: int,
+            out_channels: int,
+            cardinality: int = 8,
+            stride: int = 1,
     ):
         super().__init__()
         if out_channels % cardinality != 0:
@@ -157,19 +192,14 @@ class ResNeXtUNet(nn.Module):
 
     def forward(
         self,
-        geo: Optional[torch.Tensor] = None,
-        mw: Optional[torch.Tensor] = None,
+        inpt: Dict[str, torch.Tensor]
     ) -> torch.Tensor:
-        if geo is None and mw is None:
-            raise ValueError("At least one of 'geo' or 'mw' must be provided.")
 
-        # Encode each available input; missing channels (NaN) become zeros.
-        mw_feat = None
-        if mw is not None:
-            mw_feat = self.mw_stem(torch.nan_to_num(mw))
-        geo_feat = None
-        if geo is not None:
-            geo_feat = self.geo_stem(torch.nan_to_num(geo))
+        geo = inpt["geo"]
+        mw = inpt["mw"]
+
+        mw_feat = self.mw_stem(torch.nan_to_num(mw))
+        geo_feat = self.geo_stem(torch.nan_to_num(geo))
 
         # The output resolution follows the microwave/reference grid.
         reference = mw_feat if mw_feat is not None else geo_feat
@@ -207,4 +237,7 @@ class ResNeXtUNet(nn.Module):
             x = upsample(x)
             x = block(torch.cat([x, skip], dim=1))
 
-        return self.head(x)
+        return QuantileTensor(
+            self.head(x),
+            tau=quantiles
+        )
