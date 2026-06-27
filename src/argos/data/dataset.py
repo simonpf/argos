@@ -1038,6 +1038,15 @@ class ArgosTrainingData(Dataset):
         obs_c0 = min(max(int(col_c) - obs_size // 2, 0), obs_cols - obs_size)
         ref_r0, ref_c0 = obs_r0 // RESOLUTION_RATIO, obs_c0 // RESOLUTION_RATIO
 
+        # Reference surface precipitation (the target). The jittered crop can miss
+        # the (sparse) valid reference data, so fall back to a random sample if
+        # the target has no valid pixel.
+        surface_precip = self._load_reference(
+            sample["reference"], ref_r0, ref_c0, self.tile_size
+        )
+        if not np.isfinite(surface_precip).any():
+            return self[np.random.randint(len(self))]
+
         # For each input group, randomly choose one of the available sensors and
         # load its observations. ``"geo"`` is high resolution, ``"mw"`` is on the
         # reference grid. When slotting, the observations are mapped onto the
@@ -1059,13 +1068,8 @@ class ArgosTrainingData(Dataset):
             else:
                 obs[sensor] = torch.from_numpy(array)
 
-        # Reference surface precipitation (the target).
-        surface_precip = self._load_reference(
-            sample["reference"], ref_r0, ref_c0, self.tile_size
-        )
-
         inputs = {
-            "obs": obs,
+            **obs,
             "coordinates": (int(row_c), int(col_c)),
             "latitude": torch.from_numpy(
                 latitude[ref_r0 : ref_r0 + self.tile_size].copy()
@@ -1176,10 +1180,10 @@ def plot_sample(sample: Tuple[Dict[str, object], object], n_channels: int = 3, r
 
     Args:
         sample: An ``(inputs, target)`` tuple as returned by
-            ``ArgosTrainingData.__getitem__`` -- ``inputs`` holding an ``"obs"``
-            mapping of sensor name to observation tensor and ``"latitude"`` /
-            ``"longitude"`` coordinate tensors, and ``target`` the surface
-            precipitation tensor.
+            ``ArgosTrainingData.__getitem__`` -- ``inputs`` holding the
+            observation tensors keyed by group/sensor at the top level alongside
+            ``"latitude"`` / ``"longitude"`` coordinate tensors, and ``target``
+            the surface precipitation tensor.
         n_channels: The number of channels to show per input sensor.
         rng: Optional seed or ``numpy.random.Generator`` controlling the random
             channel selection.
@@ -1192,7 +1196,11 @@ def plot_sample(sample: Tuple[Dict[str, object], object], n_channels: int = 3, r
     rng = np.random.default_rng(rng)
 
     inputs, target = sample
-    obs = inputs["obs"]
+    obs = {
+        key: value
+        for key, value in inputs.items()
+        if key not in ("coordinates", "latitude", "longitude")
+    }
     sensors = list(obs)
     precip = np.asarray(target)
     lat = np.asarray(inputs["latitude"])
