@@ -491,20 +491,31 @@ class ArgosTrainingData(Dataset):
     # ------------------------------------------------------------------
     # Metadata loading
     # ------------------------------------------------------------------
-    def _load_indices(self, files_by_name, compute) -> Dict[str, xr.Dataset]:
+    def _list_stores(self, name: str) -> List[Path]:
+        """
+        List a dataset's ``.zarr`` stores by globbing its sub-directory.
+
+        This is only used when an index has to be (re)computed; on the cached
+        path the store filenames are taken from ``index_<name>.nc`` instead,
+        avoiding the slow directory listing over the network filesystem.
+        """
+        return sorted((self.path / name).glob("*.zarr"))
+
+    def _load_indices(self, sensors, compute) -> Dict[str, xr.Dataset]:
         """
         Load (or compute and cache) the per-sensor index of each named dataset.
 
         Returns a mapping of name to its index dataset, skipping names with no
-        stores. A cached index that predates the per-channel ``obs_min``/
-        ``obs_max`` statistics is recomputed so the normalization stats stay
-        available.
+        stores. The cached ``index_<name>.nc`` already records the store
+        filenames, so the (slow) directory listing is only performed for a sensor
+        whose index is missing or predates the per-channel ``obs_min``/
+        ``obs_max`` statistics.
         """
         indices = {}
-        for name, files in files_by_name.items():
+        for name in sensors:
             meta = self._read_index(name)
             if meta is None or "obs_min" not in meta:
-                meta = compute(name, files)
+                meta = compute(name, self._list_stores(name))
                 self._write_index(name, meta)
             if meta.sizes["samples"] > 0:
                 indices[name] = meta
@@ -513,12 +524,14 @@ class ArgosTrainingData(Dataset):
     @cached_property
     def _geo_indices(self) -> Dict[str, xr.Dataset]:
         """Per-sensor index datasets of the geostationary inputs."""
-        return self._load_indices(self.geo_files, self._compute_geo_meta)
+        return self._load_indices(self.input_sensors, self._compute_geo_meta)
 
     @cached_property
     def _mw_indices(self) -> Dict[str, xr.Dataset]:
         """Per-sensor index datasets of the microwave inputs."""
-        return self._load_indices(self.mw_files, self._compute_reference_meta)
+        return self._load_indices(
+            self.microwave_sensors, self._compute_reference_meta
+        )
 
     @cached_property
     def geo_meta(self) -> xr.Dataset:
@@ -617,9 +630,15 @@ class ArgosTrainingData(Dataset):
         subsequent runs (see :meth:`recompute_indices` to refresh).
         """
         datasets = []
-        for name, files in self.reference_files.items():
+        for name in (self.reference_name,):
             meta = self._read_index(name)
             if meta is None:
+                files = self._list_stores(name)
+                if not files:
+                    raise FileNotFoundError(
+                        f"No reference '.zarr' stores found in "
+                        f"'{self.path / name}'."
+                    )
                 meta = self._compute_reference_meta(name, files)
                 self._write_index(name, meta)
             datasets.append(self._attach_paths(meta, name))
@@ -804,7 +823,7 @@ class ArgosTrainingData(Dataset):
     @cached_property
     def _reference_grid(self) -> Tuple[np.ndarray, np.ndarray]:
         """The (latitude, longitude) arrays of the global reference grid."""
-        first = self.reference_files[self.reference_name][0]
+        first = self.reference_meta["path"].values[0]
         store = zarr.open_group(str(first), mode="r")
         return (
             np.asarray(store["latitude"][:]).astype(np.float32),
