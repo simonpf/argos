@@ -1005,13 +1005,13 @@ class ArgosTrainingData(Dataset):
         stats = self.normalization_stats.get(sensor)
         if stats is None:
             return array
-        lo = stats["min"][:, None, None]
-        span = stats["max"][:, None, None] - lo
+        lower = stats["min"][:, None, None]
+        rng = stats["max"][:, None, None] - lower
         # Leave channels without valid statistics (e.g. never-observed) as is.
-        valid = np.isfinite(lo) & np.isfinite(span) & (span > 0)
-        lo = np.where(valid, lo, 0.0)
-        span = np.where(valid, span, 1.0)
-        return ((array - lo) / span).astype(np.float32)
+        valid = np.isfinite(lower) & np.isfinite(rng) & (rng > 0)
+        lower = np.where(valid, lower, 0.0)
+        rng = np.where(valid, rng, 1.0)
+        return -1.0 + 2.0 * ((array - lower) / rng).astype(np.float32)
 
     def __len__(self) -> int:
         return len(self.samples)
