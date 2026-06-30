@@ -64,6 +64,26 @@ quantiles = [
     0.96774194,
     0.99
 ]
+import torch
+
+
+def channel_dropout(
+    x: torch.Tensor,
+    p: float,
+    training: bool = True,
+) -> torch.Tensor:
+    """Drop complete input channels independently for each sample."""
+    if not training or p == 0.0:
+        return x
+    if not 0.0 <= p < 1.0:
+        raise ValueError("p must satisfy 0 <= p < 1")
+
+    mask_shape = x.shape[:2] + (1,) * (x.ndim - 2)
+    mask = (
+        p < torch.rand(mask_shape, device=x.device)
+    ).to(dtype=x.dtype)
+    return x * mask
+
 
 class ResNeXtBlock(nn.Module):
     """
@@ -136,7 +156,6 @@ class ResNeXtUNet(nn.Module):
         self,
         geo_channels: int = N_SLOTS,
         mw_channels: int = N_MW_SLOTS,
-        out_channels: int = 1,
         base_channels: int = 32,
         depth: int = 3,
         cardinality: int = 8,
@@ -148,6 +167,8 @@ class ResNeXtUNet(nn.Module):
         self.mw_channels = mw_channels
         self.base_channels = base_channels
         self.geo_downsample = geo_downsample
+        out_channels = len(quantiles)
+
 
         # Number of blocks in each (increasingly coarse) encoder stage.
         if blocks_per_stage is None:
@@ -215,6 +236,7 @@ class ResNeXtUNet(nn.Module):
             )
             channels //= 2
 
+        self.quantiles = torch.tensor(quantiles)
         self.head = nn.Conv2d(channels, out_channels, 1)
 
     @staticmethod
@@ -237,10 +259,16 @@ class ResNeXtUNet(nn.Module):
         self,
         inpt: Dict[str, torch.Tensor]
     ) -> torch.Tensor:
-
-        geo = inpt["geo"]
-        mw = inpt["mw"]
-
+        geo = channel_dropout(
+            inpt["geo"],
+            0.1,
+            training=self.training
+        )
+        mw = channel_dropout(
+            inpt["mw"],
+            0.1,
+            training=self.training,
+        )
         mw_feat = self.mw_stem(torch.nan_to_num(mw))
         geo_feat = self.geo_stem(torch.nan_to_num(geo))
 
@@ -280,7 +308,9 @@ class ResNeXtUNet(nn.Module):
             x = upsample(x)
             x = block(torch.cat([x, skip], dim=1))
 
-        return QuantileTensor(
-            self.head(x),
-            tau=quantiles
-        )
+        return {
+            "surface_precip": QuantileTensor(
+                self.head(x),
+                tau=self.quantiles.to(dtype=x.dtype, device=x.device)
+            )
+        }
