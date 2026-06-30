@@ -1216,11 +1216,187 @@ class ArgosTrainingData(Dataset):
             array = self._normalize(array, sensor)
         return slot_observations(array, sensor)
 
+    def _load_slotted_stack(
+        self, si, index, col, loader, r0, c0, size, n_steps, n_slots
+    ) -> np.ndarray:
+        """
+        Load a temporal stack of one sensor's observations.
+
+        The matched observation plus the ``n_steps`` preceding stores of the same
+        sensor (at the same crop) are stacked along axis 1, oldest first with the
+        matched (reference-co-located) frame last. Missing predecessors (at the
+        start of the sensor's record) are left as ``NaN``.
+        """
+        sensor = str(si.sensors[col])
+        files = si.filenames[sensor]
+        matched = int(si.sensor_file[index, col])
+        stack = np.full((n_slots, n_steps + 1, size, size), np.nan, dtype=np.float32)
+        for step in range(n_steps + 1):
+            k = matched - n_steps + step
+            if k < 0:
+                continue
+            array = loader(self._store_path(sensor, files[k]), r0, c0, size)
+            if self.normalize:
+                array = self._normalize(array, sensor)
+            stack[:, step] = slot_observations(array, sensor)
+        return stack
+
     @staticmethod
     def _filename_time(filename) -> np.datetime64:
         """Timestamp parsed from a store filename (``NaT`` if absent)."""
         stamp = _parse_timestamp(Path(str(filename)))
         return stamp if stamp is not None else np.datetime64("NaT")
+
+    def _enumerate_scenes(self, start_time, end_time):
+        """
+        Select samples within ``[start_time, end_time]`` and expand them into
+        ``(sample index, geo column, mw column)`` scenes -- one per matching
+        ``(geo, mw)`` sensor combination (``-1`` where a group is absent). Returns
+        the scene list and the per-sample reference times.
+        """
+        si = self.samples
+        ref_times = np.array(
+            [self._filename_time(fn) for fn in si.ref_filenames],
+            dtype="datetime64[ns]",
+        )
+        sample_times = ref_times[si.ref_file]
+        keep = np.ones(len(si), dtype=bool)
+        if start_time is not None:
+            keep &= sample_times >= np.datetime64(start_time)
+        if end_time is not None:
+            keep &= sample_times <= np.datetime64(end_time)
+
+        scenes = []
+        for index in np.where(keep)[0]:
+            sensor_file = si.sensor_file[index]
+            geo = [c for c in si.geo_cols if sensor_file[c] >= 0] or [-1]
+            mw = [c for c in si.mw_cols if sensor_file[c] >= 0] or [-1]
+            for geo_col in geo:
+                for mw_col in mw:
+                    if geo_col < 0 and mw_col < 0:
+                        continue
+                    scenes.append((int(index), int(geo_col), int(mw_col)))
+        return scenes, sample_times
+
+    def _write_scenes(
+        self, output_path, scenes, sample_times, n_steps: Optional[int]
+    ) -> Path:
+        """
+        Write the enumerated scenes to a standalone ``.zarr`` store.
+
+        If ``n_steps`` is ``None`` each input is a single slotted observation;
+        otherwise each input is a temporal stack of ``n_steps + 1`` frames along
+        axis 1 (see :meth:`_load_slotted_stack`).
+        """
+        from numcodecs.zarr3 import Blosc
+
+        output_path = Path(output_path)
+        si = self.samples
+        obs_size = self.tile_size * RESOLUTION_RATIO
+        obs_rows, obs_cols = N_CELLS_LAT * OBS_CELL, N_CELLS_LON * OBS_CELL
+        temporal = n_steps is not None
+        n_scenes = len(scenes)
+        LOGGER.info("Extracting %d scenes to '%s'.", n_scenes, output_path)
+
+        compressor = Blosc(cname="zstd", clevel=4)
+        store = zarr.open_group(str(output_path), mode="w")
+        store.attrs["sensors"] = [str(s) for s in si.sensors]
+        store.attrs["groups"] = [str(g) for g in si.groups]
+        store.attrs["tile_size"] = self.tile_size
+        store.attrs["resolution_ratio"] = RESOLUTION_RATIO
+        store.attrs["normalized"] = self.normalize
+        store.attrs["time_units"] = "nanoseconds since 1970-01-01"
+        if temporal:
+            store.attrs["n_steps"] = n_steps
+
+        if temporal:
+            frames = n_steps + 1
+            geo_shape = (n_scenes, N_SLOTS, frames, obs_size, obs_size)
+            geo_dims = ("scene", "geo_channel", "step", "geo_y", "geo_x")
+            mw_shape = (n_scenes, N_MW_SLOTS, frames, self.tile_size, self.tile_size)
+            mw_dims = ("scene", "mw_channel", "step", "y", "x")
+        else:
+            geo_shape = (n_scenes, N_SLOTS, obs_size, obs_size)
+            geo_dims = ("scene", "geo_channel", "geo_y", "geo_x")
+            mw_shape = (n_scenes, N_MW_SLOTS, self.tile_size, self.tile_size)
+            mw_dims = ("scene", "mw_channel", "y", "x")
+
+        store.create_array(
+            "geo", shape=geo_shape, chunks=(1,) + geo_shape[1:], dtype=np.float32,
+            fill_value=np.nan, compressors=compressor, dimension_names=geo_dims,
+        )
+        store.create_array(
+            "mw", shape=mw_shape, chunks=(1,) + mw_shape[1:], dtype=np.float32,
+            fill_value=np.nan, compressors=compressor, dimension_names=mw_dims,
+        )
+        store.create_array(
+            "surface_precip", shape=(n_scenes, self.tile_size, self.tile_size),
+            chunks=(1, self.tile_size, self.tile_size), dtype=np.float32,
+            fill_value=np.nan, compressors=compressor,
+            dimension_names=("scene", "y", "x"),
+        )
+        store.create_array(
+            "coordinates", shape=(n_scenes, 2), dtype=np.int32,
+            dimension_names=("scene", "row_col"),
+        )
+        store.create_array(
+            "time", shape=(n_scenes,), dtype=np.int64, dimension_names=("scene",),
+        )
+        for name in ("geo_sensor", "mw_sensor"):
+            store.create_array(
+                name, shape=(n_scenes,), dtype=np.int16, fill_value=-1,
+                dimension_names=("scene",),
+            )
+
+        for i, (index, geo_col, mw_col) in enumerate(
+            tqdm(scenes, desc="Extracting scenes", unit="scene")
+        ):
+            row_c, col_c = int(si.coords[index, 0]), int(si.coords[index, 1])
+            if self.position_jitter > 0:
+                row_c += RESOLUTION_RATIO * np.random.randint(
+                    -self.position_jitter, self.position_jitter + 1
+                )
+                col_c += RESOLUTION_RATIO * np.random.randint(
+                    -self.position_jitter, self.position_jitter + 1
+                )
+            obs_r0 = min(max(row_c - obs_size // 2, 0), obs_rows - obs_size)
+            obs_c0 = min(max(col_c - obs_size // 2, 0), obs_cols - obs_size)
+            ref_r0, ref_c0 = obs_r0 // RESOLUTION_RATIO, obs_c0 // RESOLUTION_RATIO
+
+            reference = self._store_path(
+                self.reference_name, si.ref_filenames[si.ref_file[index]]
+            )
+            store["surface_precip"][i] = self._load_reference(
+                reference, ref_r0, ref_c0, self.tile_size
+            )
+            if geo_col >= 0:
+                if temporal:
+                    store["geo"][i] = self._load_slotted_stack(
+                        si, index, geo_col, self._load_obs,
+                        obs_r0, obs_c0, obs_size, n_steps, N_SLOTS,
+                    )
+                else:
+                    store["geo"][i] = self._load_slotted(
+                        si, index, geo_col, self._load_obs, obs_r0, obs_c0, obs_size
+                    )
+                store["geo_sensor"][i] = geo_col
+            if mw_col >= 0:
+                if temporal:
+                    store["mw"][i] = self._load_slotted_stack(
+                        si, index, mw_col, self._load_mw_obs,
+                        ref_r0, ref_c0, self.tile_size, n_steps, N_MW_SLOTS,
+                    )
+                else:
+                    store["mw"][i] = self._load_slotted(
+                        si, index, mw_col, self._load_mw_obs,
+                        ref_r0, ref_c0, self.tile_size,
+                    )
+                store["mw_sensor"][i] = mw_col
+            store["coordinates"][i] = (row_c, col_c)
+            store["time"][i] = sample_times[index].astype("int64")
+
+        LOGGER.info("Wrote %d scenes to '%s'.", n_scenes, output_path)
+        return output_path
 
     def extract_samples(
         self,
@@ -1251,121 +1427,40 @@ class ArgosTrainingData(Dataset):
         Returns:
             The output path.
         """
-        from numcodecs.zarr3 import Blosc
+        scenes, sample_times = self._enumerate_scenes(start_time, end_time)
+        return self._write_scenes(output_path, scenes, sample_times, n_steps=None)
 
-        output_path = Path(output_path)
-        si = self.samples
-        obs_size = self.tile_size * RESOLUTION_RATIO
-        obs_rows, obs_cols = N_CELLS_LAT * OBS_CELL, N_CELLS_LON * OBS_CELL
+    def extract_temporal_samples(
+        self,
+        output_path: Union[str, Path],
+        n_steps: int,
+        start_time: Optional[Union[str, np.datetime64]] = None,
+        end_time: Optional[Union[str, np.datetime64]] = None,
+    ) -> Path:
+        """
+        Like :meth:`extract_samples`, but each input is a temporal stack.
 
-        # Sample time = reference granule time (parsed from the filename).
-        ref_times = np.array(
-            [self._filename_time(fn) for fn in si.ref_filenames],
-            dtype="datetime64[ns]",
+        In addition to the matching observation, the ``n_steps`` preceding stores
+        of the same sensor are loaded (at the same spatial crop) and stacked along
+        axis 1, giving ``geo`` of shape
+        ``(n_scenes, N_SLOTS, n_steps + 1, H, W)`` and ``mw`` of shape
+        ``(n_scenes, N_MW_SLOTS, n_steps + 1, h, w)`` -- oldest first, with the
+        matched (reference-co-located) frame last. Missing predecessors at the
+        start of a sensor's record are left as ``NaN``.
+
+        Args:
+            output_path: Path of the output ``.zarr`` store.
+            n_steps: Number of previous time steps stacked with each observation.
+            start_time: Optional lower bound on the sample's reference time.
+            end_time: Optional upper bound on the sample's reference time.
+
+        Returns:
+            The output path.
+        """
+        scenes, sample_times = self._enumerate_scenes(start_time, end_time)
+        return self._write_scenes(
+            output_path, scenes, sample_times, n_steps=int(n_steps)
         )
-        sample_times = ref_times[si.ref_file]
-        keep = np.ones(len(si), dtype=bool)
-        if start_time is not None:
-            keep &= sample_times >= np.datetime64(start_time)
-        if end_time is not None:
-            keep &= sample_times <= np.datetime64(end_time)
-
-        # Enumerate scenes: one per (geo sensor, mw sensor) combination available.
-        scenes = []  # (sample index, geo column, mw column); -1 = group absent
-        for index in np.where(keep)[0]:
-            sensor_file = si.sensor_file[index]
-            geo = [c for c in si.geo_cols if sensor_file[c] >= 0] or [-1]
-            mw = [c for c in si.mw_cols if sensor_file[c] >= 0] or [-1]
-            for geo_col in geo:
-                for mw_col in mw:
-                    if geo_col < 0 and mw_col < 0:
-                        continue
-                    scenes.append((int(index), int(geo_col), int(mw_col)))
-
-        n_scenes = len(scenes)
-        LOGGER.info(
-            "Extracting %d scenes from %d samples to '%s'.",
-            n_scenes, int(keep.sum()), output_path,
-        )
-
-        compressor = Blosc(cname="zstd", clevel=4)
-        store = zarr.open_group(str(output_path), mode="w")
-        store.attrs["sensors"] = [str(s) for s in si.sensors]
-        store.attrs["groups"] = [str(g) for g in si.groups]
-        store.attrs["tile_size"] = self.tile_size
-        store.attrs["resolution_ratio"] = RESOLUTION_RATIO
-        store.attrs["normalized"] = self.normalize
-        store.attrs["time_units"] = "nanoseconds since 1970-01-01"
-
-        store.create_array(
-            "geo", shape=(n_scenes, N_SLOTS, obs_size, obs_size),
-            chunks=(1, N_SLOTS, obs_size, obs_size), dtype=np.float32,
-            fill_value=np.nan, compressors=compressor,
-            dimension_names=("scene", "geo_channel", "geo_y", "geo_x"),
-        )
-        store.create_array(
-            "mw", shape=(n_scenes, N_MW_SLOTS, self.tile_size, self.tile_size),
-            chunks=(1, N_MW_SLOTS, self.tile_size, self.tile_size), dtype=np.float32,
-            fill_value=np.nan, compressors=compressor,
-            dimension_names=("scene", "mw_channel", "y", "x"),
-        )
-        store.create_array(
-            "surface_precip", shape=(n_scenes, self.tile_size, self.tile_size),
-            chunks=(1, self.tile_size, self.tile_size), dtype=np.float32,
-            fill_value=np.nan, compressors=compressor,
-            dimension_names=("scene", "y", "x"),
-        )
-        store.create_array(
-            "coordinates", shape=(n_scenes, 2), dtype=np.int32,
-            dimension_names=("scene", "row_col"),
-        )
-        store.create_array(
-            "time", shape=(n_scenes,), dtype=np.int64,
-            dimension_names=("scene",),
-        )
-        for name in ("geo_sensor", "mw_sensor"):
-            store.create_array(
-                name, shape=(n_scenes,), dtype=np.int16, fill_value=-1,
-                dimension_names=("scene",),
-            )
-
-        for i, (index, geo_col, mw_col) in enumerate(
-            tqdm(scenes, desc="Extracting scenes", unit="scene")
-        ):
-            row_c, col_c = int(si.coords[index, 0]), int(si.coords[index, 1])
-            if self.position_jitter > 0:
-                row_c += RESOLUTION_RATIO * np.random.randint(
-                    -self.position_jitter, self.position_jitter + 1
-                )
-                col_c += RESOLUTION_RATIO * np.random.randint(
-                    -self.position_jitter, self.position_jitter + 1
-                )
-            obs_r0 = min(max(row_c - obs_size // 2, 0), obs_rows - obs_size)
-            obs_c0 = min(max(col_c - obs_size // 2, 0), obs_cols - obs_size)
-            ref_r0, ref_c0 = obs_r0 // RESOLUTION_RATIO, obs_c0 // RESOLUTION_RATIO
-
-            reference = self._store_path(
-                self.reference_name, si.ref_filenames[si.ref_file[index]]
-            )
-            store["surface_precip"][i] = self._load_reference(
-                reference, ref_r0, ref_c0, self.tile_size
-            )
-            if geo_col >= 0:
-                store["geo"][i] = self._load_slotted(
-                    si, index, geo_col, self._load_obs, obs_r0, obs_c0, obs_size
-                )
-                store["geo_sensor"][i] = geo_col
-            if mw_col >= 0:
-                store["mw"][i] = self._load_slotted(
-                    si, index, mw_col, self._load_mw_obs,
-                    ref_r0, ref_c0, self.tile_size,
-                )
-                store["mw_sensor"][i] = mw_col
-            store["coordinates"][i] = (row_c, col_c)
-            store["time"][i] = sample_times[index].astype("int64")
-
-        LOGGER.info("Wrote %d scenes to '%s'.", n_scenes, output_path)
-        return output_path
 
     # ------------------------------------------------------------------
     # Diagnostics
