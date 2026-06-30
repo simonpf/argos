@@ -550,7 +550,7 @@ class ArgosTrainingData(Dataset):
         :attr:`normalization_stats`.
         """
         datasets = [
-            self._attach_paths(idx, sensor).drop_vars(
+            self._attach_name(idx, sensor).drop_vars(
                 ["obs_min", "obs_max"], errors="ignore"
             )
             for sensor, idx in self._geo_indices.items()
@@ -641,7 +641,7 @@ class ArgosTrainingData(Dataset):
                     )
                 meta = self._compute_reference_meta(name, files)
                 self._write_index(name, meta)
-            datasets.append(self._attach_paths(meta, name))
+            datasets.append(self._attach_name(meta, name))
         datasets = [ds for ds in datasets if ds.sizes["samples"] > 0]
         if not datasets:
             raise FileNotFoundError("No reference '.zarr' stores found.")
@@ -661,13 +661,13 @@ class ArgosTrainingData(Dataset):
         :attr:`normalization_stats`.
         """
         datasets = [
-            self._attach_paths(idx, sensor).drop_vars(
+            self._attach_name(idx, sensor).drop_vars(
                 ["obs_min", "obs_max"], errors="ignore"
             )
             for sensor, idx in self._mw_indices.items()
         ]
         if not datasets:
-            return self._attach_paths(self._compute_reference_meta("", []), "")
+            return self._attach_name(self._compute_reference_meta("", []), "")
         return xr.concat(datasets, dim="samples")
 
     @cached_property
@@ -752,14 +752,25 @@ class ArgosTrainingData(Dataset):
             coords={"filename": ("samples", np.array(names, dtype=object))},
         )
 
-    def _attach_paths(self, meta: xr.Dataset, name: str) -> xr.Dataset:
-        """Add ``name`` and full ``path`` coordinates to a per-name index."""
+    def _attach_name(self, meta: xr.Dataset, name: str) -> xr.Dataset:
+        """Add the ``name`` (sensor) coordinate to a per-name index.
+
+        The full store path is not stored; it is reconstructed on the fly from
+        the ``name`` and ``filename`` coordinates (see :meth:`_store_path`).
+        """
         n = meta.sizes["samples"]
-        paths = [str(self.path / name / str(fn)) for fn in meta["filename"].values]
-        return meta.assign_coords(
-            name=("samples", np.full(n, name, dtype=object)),
-            path=("samples", np.array(paths, dtype=object)),
-        )
+        return meta.assign_coords(name=("samples", np.full(n, name, dtype=object)))
+
+    @staticmethod
+    def _as_str(value) -> str:
+        """Coerce a coordinate value to a plain ``str`` (decoding bytes)."""
+        if isinstance(value, bytes):
+            return value.decode()
+        return str(value)
+
+    def _store_path(self, name, filename) -> Path:
+        """Reconstruct a store path from its sensor name and filename."""
+        return self.path / self._as_str(name) / self._as_str(filename)
 
     # ------------------------------------------------------------------
     # Index caching
@@ -823,7 +834,10 @@ class ArgosTrainingData(Dataset):
     @cached_property
     def _reference_grid(self) -> Tuple[np.ndarray, np.ndarray]:
         """The (latitude, longitude) arrays of the global reference grid."""
-        first = self.reference_meta["path"].values[0]
+        ref = self.reference_meta
+        first = self._store_path(
+            ref["name"].values[0], ref["filename"].values[0]
+        )
         store = zarr.open_group(str(first), mode="r")
         return (
             np.asarray(store["latitude"][:]).astype(np.float32),
@@ -864,7 +878,8 @@ class ArgosTrainingData(Dataset):
         ref = self.reference_meta
         ref_avail = ref["availability"].values.astype(bool)
         ref_time = ref["time"].values
-        ref_path = ref["path"].values
+        ref_name = ref["name"].values
+        ref_filename = ref["filename"].values
 
         samples: List[Dict[str, object]] = []
         for ref_idx in tqdm(
@@ -886,7 +901,7 @@ class ArgosTrainingData(Dataset):
                 candidates = np.where(
                     (info["tmax"] >= tmin - window) & (info["tmin"] <= tmax + window)
                 )[0]
-                best_matched, best_path, best_score = None, None, 0
+                best_matched, best_filename, best_score = None, None, 0
                 for k in candidates:
                     matched = (
                         r_avail
@@ -895,25 +910,28 @@ class ArgosTrainingData(Dataset):
                     )
                     score = matched.sum()
                     if score > best_score:
-                        best_matched, best_path, best_score = matched, info["path"][k], score
-                if best_path is not None:
-                    matched_by_sensor[sensor] = (best_matched, best_path)
+                        best_matched, best_filename, best_score = (
+                            matched, info["filename"][k], score
+                        )
+                if best_filename is not None:
+                    matched_by_sensor[sensor] = (best_matched, best_filename)
             if not matched_by_sensor:
                 continue
 
             # Every reference cell with at least one matching input is a sample.
+            # Store paths are reconstructed from the sensor name and filename.
             any_matched = np.zeros((N_CELLS_LAT, N_CELLS_LON), dtype=bool)
             for matched, _ in matched_by_sensor.values():
                 any_matched |= matched
             for ci, cj in np.argwhere(any_matched):
                 geo = {
-                    sensor: Path(str(path))
-                    for sensor, (matched, path) in matched_by_sensor.items()
+                    sensor: self._store_path(sensor, fname)
+                    for sensor, (matched, fname) in matched_by_sensor.items()
                     if self._sensor_group[sensor] == "geo" and matched[ci, cj]
                 }
                 mw = {
-                    sensor: Path(str(path))
-                    for sensor, (matched, path) in matched_by_sensor.items()
+                    sensor: self._store_path(sensor, fname)
+                    for sensor, (matched, fname) in matched_by_sensor.items()
                     if self._sensor_group[sensor] == "mw" and matched[ci, cj]
                 }
                 if self.require_both_inputs and not (geo and mw):
@@ -926,7 +944,9 @@ class ArgosTrainingData(Dataset):
                         ),
                         "geo": geo,
                         "mw": mw,
-                        "reference": Path(str(ref_path[ref_idx])),
+                        "reference": self._store_path(
+                            ref_name[ref_idx], ref_filename[ref_idx]
+                        ),
                     }
                 )
 
@@ -934,7 +954,7 @@ class ArgosTrainingData(Dataset):
             "Built %d samples from %d reference and %d input stores.",
             len(samples),
             ref_avail.shape[0],
-            sum(info["path"].shape[0] for info in inputs.values()),
+            sum(info["filename"].shape[0] for info in inputs.values()),
         )
         return samples
 
@@ -943,15 +963,16 @@ class ArgosTrainingData(Dataset):
         Group a metadata dataset into per-sensor matching arrays.
 
         Returns, per sensor, the ``availability`` ``(n, 90, 180)`` and ``time``
-        (``(n,)`` for geo or ``(n, 90, 180)`` for microwave) arrays, the file
-        ``path`` array, and the per-file time span (``tmin``/``tmax``) used to
-        pre-filter candidates.
+        (``(n,)`` for geo or ``(n, 90, 180)`` for microwave) arrays, the
+        ``filename`` array (``str``; the full path is built on the fly via
+        :meth:`_store_path`), and the per-file time span (``tmin``/``tmax``) used
+        to pre-filter candidates.
         """
         if meta.sizes["samples"] == 0:
             return {}
         availability = meta["availability"].values.astype(bool)
         time = meta["time"].values
-        path = meta["path"].values
+        filename = meta["filename"].values
         name = meta["name"].values
 
         result: Dict[str, Dict[str, np.ndarray]] = {}
@@ -973,7 +994,7 @@ class ArgosTrainingData(Dataset):
             result[str(sensor)] = {
                 "availability": availability[sel],
                 "time": s_time,
-                "path": path[sel],
+                "filename": filename[sel],
                 "tmin": tmin,
                 "tmax": tmax,
             }
