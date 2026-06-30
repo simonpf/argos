@@ -35,6 +35,7 @@ suitable, temporally-matched samples can be enumerated without touching the
 (large) observation arrays.
 """
 from functools import cached_property
+import hashlib
 import logging
 from pathlib import Path
 import re
@@ -373,6 +374,96 @@ def worker_init_fn(worker_id: int) -> None:
     np.random.seed(torch.initial_seed() % (2**32))
 
 
+class _SampleIndex:
+    """
+    Compact, fork-safe table of training samples.
+
+    Each sample is one reduced-resolution reference cell with at least one valid
+    input. The data is held in a few contiguous numpy arrays rather than a list
+    of dicts, so forked ``DataLoader`` workers share it via copy-on-write without
+    the memory blow-up (and refcount churn) of a large Python object graph. It is
+    also small enough to cache to disk and reload directly, avoiding a re-read of
+    the large per-sensor metadata indices in every worker.
+
+    Arrays (``n`` samples, ``S`` input sensors, ``R`` reference files):
+
+    * ``coords`` ``(n, 2)`` int32 -- full-resolution ``(row, column)`` cell center
+    * ``ref_file`` ``(n,)`` int32 -- index into ``ref_filenames``
+    * ``sensor_file`` ``(n, S)`` int32 -- per-sensor file index, ``-1`` if the
+      sensor has no matching data at the sample
+    * ``sensors`` ``(S,)`` / ``groups`` ``(S,)`` -- column sensor names and their
+      ``"geo"``/``"mw"`` group
+    * ``filenames`` -- sensor name -> its ``str`` filename array
+    * ``ref_filenames`` ``(R,)`` -- reference filenames
+    * ``norm_stats`` -- per-sensor normalization statistics
+    """
+
+    def __init__(
+        self,
+        coords: np.ndarray,
+        ref_file: np.ndarray,
+        sensor_file: np.ndarray,
+        sensors: np.ndarray,
+        groups: np.ndarray,
+        filenames: Dict[str, np.ndarray],
+        ref_filenames: np.ndarray,
+        norm_stats: Dict[str, Dict[str, np.ndarray]],
+    ):
+        self.coords = coords
+        self.ref_file = ref_file
+        self.sensor_file = sensor_file
+        self.sensors = sensors
+        self.groups = groups
+        self.filenames = filenames
+        self.ref_filenames = ref_filenames
+        self.norm_stats = norm_stats
+        self.geo_cols = np.where(groups == "geo")[0]
+        self.mw_cols = np.where(groups == "mw")[0]
+
+    def __len__(self) -> int:
+        return self.coords.shape[0]
+
+    def save(self, path: Path) -> None:
+        arrays = {
+            "coords": self.coords,
+            "ref_file": self.ref_file,
+            "sensor_file": self.sensor_file,
+            "sensors": self.sensors,
+            "groups": self.groups,
+            "ref_filenames": self.ref_filenames,
+        }
+        for sensor in self.sensors.tolist():
+            arrays[f"fn__{sensor}"] = self.filenames[sensor]
+            stats = self.norm_stats.get(sensor)
+            if stats is not None:
+                arrays[f"nmin__{sensor}"] = stats["min"]
+                arrays[f"nmax__{sensor}"] = stats["max"]
+        np.savez_compressed(str(path), **arrays)
+
+    @classmethod
+    def load(cls, path: Path) -> "_SampleIndex":
+        with np.load(str(path), allow_pickle=False) as cache:
+            sensors = cache["sensors"]
+            filenames, norm_stats = {}, {}
+            for sensor in sensors.tolist():
+                filenames[sensor] = cache[f"fn__{sensor}"]
+                if f"nmin__{sensor}" in cache:
+                    norm_stats[sensor] = {
+                        "min": cache[f"nmin__{sensor}"],
+                        "max": cache[f"nmax__{sensor}"],
+                    }
+            return cls(
+                coords=cache["coords"],
+                ref_file=cache["ref_file"],
+                sensor_file=cache["sensor_file"],
+                sensors=sensors,
+                groups=cache["groups"],
+                filenames=filenames,
+                ref_filenames=cache["ref_filenames"],
+                norm_stats=norm_stats,
+            )
+
+
 class ArgosTrainingData(Dataset):
     """
     Dataset pairing geostationary observations with GPM surface precipitation.
@@ -631,7 +722,7 @@ class ArgosTrainingData(Dataset):
             self.microwave_sensors, self._compute_reference_meta
         )
 
-    @cached_property
+    @property
     def normalization_stats(self) -> Dict[str, Dict[str, np.ndarray]]:
         """
         Per-sensor input normalization statistics.
@@ -640,8 +731,13 @@ class ArgosTrainingData(Dataset):
         per-channel array giving the minimum and maximum observed value across
         all of the sensor's stores (in the sensor's stored channel order). Used
         by :meth:`__getitem__` to scale the inputs to ``[0, 1]`` when
-        ``normalize`` is enabled.
+        ``normalize`` is enabled. Computed once with the sample index and stored
+        in its cache.
         """
+        return self.samples.norm_stats
+
+    def _compute_normalization_stats(self) -> Dict[str, Dict[str, np.ndarray]]:
+        """Per-channel min/max across each sensor's stores (built with samples)."""
         stats = {}
         for sensor, idx in {**self.geo_meta, **self.microwave_meta}.items():
             if "obs_min" not in idx:
@@ -759,9 +855,8 @@ class ArgosTrainingData(Dataset):
         """
         Delete any cached metadata indices and recompute them from the stores.
 
-        This discards the ``index_<name>.nc`` files and the cached ``geo_meta``,
-        ``microwave_meta``, ``reference_meta`` and ``samples`` so that the next
-        access re-reads the stores and writes fresh indices.
+        This discards the ``index_<name>.nc`` files and the cached sample index so
+        that the next access re-reads the stores and rebuilds them.
         """
         names = (
             *self.input_sensors,
@@ -773,22 +868,23 @@ class ArgosTrainingData(Dataset):
             if path.exists():
                 path.unlink()
                 LOGGER.info("Removed cached index '%s'.", path)
+        sample_cache = self._samples_cache_path
+        if sample_cache.exists():
+            sample_cache.unlink()
+            LOGGER.info("Removed cached sample index '%s'.", sample_cache)
         for attr in (
             "geo_meta", "microwave_meta", "reference_meta",
-            "normalization_stats", "samples",
+            "samples", "_reference_grid",
         ):
             self.__dict__.pop(attr, None)
-        # Trigger recomputation (and re-caching) of the metadata.
-        self.geo_meta
-        self.microwave_meta
-        self.reference_meta
+        # Trigger recomputation (and re-caching) of the sample index.
+        self.samples
 
     @cached_property
     def _reference_grid(self) -> Tuple[np.ndarray, np.ndarray]:
         """The (latitude, longitude) arrays of the global reference grid."""
-        ref = self.reference_meta
         first = self._store_path(
-            self.reference_name, ref["filename"].values[0]
+            self.reference_name, self.samples.ref_filenames[0]
         )
         store = zarr.open_group(str(first), mode="r")
         return (
@@ -800,24 +896,42 @@ class ArgosTrainingData(Dataset):
     # Sample enumeration
     # ------------------------------------------------------------------
     @cached_property
-    def samples(self) -> List[Dict[str, object]]:
+    def _samples_cache_path(self) -> Path:
+        """Path of the on-disk sample-index cache (keyed by the relevant config)."""
+        key = "|".join(
+            [
+                ",".join(self.input_sensors),
+                ",".join(self.microwave_sensors),
+                self.reference_name,
+                str(int(self.time_window.astype("int64"))),
+                str(self.require_both_inputs),
+            ]
+        )
+        digest = hashlib.md5(key.encode()).hexdigest()[:12]
+        return self.path / f"samples_{digest}.npz"
+
+    @cached_property
+    def samples(self) -> _SampleIndex:
         """
-        Produces list of samples specification.
+        Compact index of all training samples (see :class:`_SampleIndex`).
 
-        One sample per reduced-resolution reference cell with any valid input.
-
-        A sample is created for every reference availability cell that has valid
-        reference data and at least one input (geostationary or microwave) within
-        the time window -- or both inputs if ``require_both_inputs`` is set. Each
-        sample is a dictionary with:
-
-        * ``"coordinates"``: the ``(row, column)`` index of the cell center with
-          respect to the full-resolution (0.025-degree) input grid.
-        * ``"geo"`` / ``"mw"``: a mapping of sensor name to the ``.zarr`` store
-          available at the cell, for the geostationary and microwave inputs
-          respectively (the sensor is chosen at random on loading).
-        * ``"reference"``: the reference ``.zarr`` store.
+        One sample per reduced-resolution reference cell that has valid reference
+        data and at least one matching input (or both if ``require_both_inputs``).
+        Built once from the metadata indices and cached to ``samples_<hash>.npz``;
+        subsequent constructions and ``DataLoader`` workers load that compact
+        cache directly, without re-reading the large per-sensor index files.
         """
+        path = self._samples_cache_path
+        if path.exists():
+            LOGGER.info("Loading cached sample index from '%s'.", path)
+            return _SampleIndex.load(path)
+        samples = self._build_samples()
+        samples.save(path)
+        LOGGER.info("Wrote sample index cache to '%s'.", path)
+        return samples
+
+    def _build_samples(self) -> _SampleIndex:
+        """Enumerate samples from the metadata indices (the slow, one-off path)."""
         window = self.time_window
 
         # Per-sensor input arrays (geo and microwave), with a per-file time span
@@ -826,13 +940,17 @@ class ArgosTrainingData(Dataset):
             sensor: self._sensor_arrays(meta)
             for sensor, meta in {**self.geo_meta, **self.microwave_meta}.items()
         }
+        sensors = list(inputs)
+        n_sensors = len(sensors)
+        groups = np.array([self._sensor_group[s] for s in sensors])
+        geo_cols = list(np.where(groups == "geo")[0])
+        mw_cols = list(np.where(groups == "mw")[0])
 
         ref = self.reference_meta
         ref_avail = ref["availability"].values.astype(bool)
         ref_time = ref["time"].values
-        ref_filename = ref["filename"].values
 
-        samples: List[Dict[str, object]] = []
+        coords_blocks, ref_blocks, file_blocks = [], [], []
         for ref_idx in tqdm(
             range(ref_avail.shape[0]), desc="Building samples", unit="granule"
         ):
@@ -843,16 +961,16 @@ class ArgosTrainingData(Dataset):
                 continue
             tmin, tmax = valid.min(), valid.max()
 
-            # For each sensor, pick the file that best matches this reference
-            # granule and keep its per-cell joint availability, i.e. cells that
-            # are valid in both the reference and the input and within the time
-            # window.
-            matched_by_sensor: Dict[str, Tuple[np.ndarray, str]] = {}
-            for sensor, info in inputs.items():
+            # For each sensor, pick the file that best matches this granule and
+            # keep its per-cell joint availability (valid in both, in time).
+            masks: Dict[int, np.ndarray] = {}
+            best_k: Dict[int, int] = {}
+            for col, sensor in enumerate(sensors):
+                info = inputs[sensor]
                 candidates = np.where(
                     (info["tmax"] >= tmin - window) & (info["tmin"] <= tmax + window)
                 )[0]
-                best_matched, best_filename, best_score = None, None, 0
+                best_matched, best_idx, best_score = None, -1, 0
                 for k in candidates:
                     matched = (
                         r_avail
@@ -861,52 +979,69 @@ class ArgosTrainingData(Dataset):
                     )
                     score = matched.sum()
                     if score > best_score:
-                        best_matched, best_filename, best_score = (
-                            matched, info["filename"][k], score
-                        )
-                if best_filename is not None:
-                    matched_by_sensor[sensor] = (best_matched, best_filename)
-            if not matched_by_sensor:
+                        best_matched, best_idx, best_score = matched, k, score
+                if best_matched is not None:
+                    masks[col] = best_matched
+                    best_k[col] = best_idx
+            if not masks:
                 continue
 
             # Every reference cell with at least one matching input is a sample.
-            # Store paths are reconstructed from the sensor name and filename.
             any_matched = np.zeros((N_CELLS_LAT, N_CELLS_LON), dtype=bool)
-            for matched, _ in matched_by_sensor.values():
+            for matched in masks.values():
                 any_matched |= matched
-            for ci, cj in np.argwhere(any_matched):
-                geo = {
-                    sensor: self._store_path(sensor, fname)
-                    for sensor, (matched, fname) in matched_by_sensor.items()
-                    if self._sensor_group[sensor] == "geo" and matched[ci, cj]
-                }
-                mw = {
-                    sensor: self._store_path(sensor, fname)
-                    for sensor, (matched, fname) in matched_by_sensor.items()
-                    if self._sensor_group[sensor] == "mw" and matched[ci, cj]
-                }
-                if self.require_both_inputs and not (geo and mw):
-                    continue
-                samples.append(
-                    {
-                        "coordinates": (
-                            int(ci) * OBS_CELL + OBS_CELL // 2,
-                            int(cj) * OBS_CELL + OBS_CELL // 2,
-                        ),
-                        "geo": geo,
-                        "mw": mw,
-                        "reference": self._store_path(
-                            self.reference_name, ref_filename[ref_idx]
-                        ),
-                    }
-                )
+            cells = np.argwhere(any_matched)
+            if cells.size == 0:
+                continue
+            rows, cols = cells[:, 0], cells[:, 1]
+            sensor_file = np.full((cells.shape[0], n_sensors), -1, dtype=np.int32)
+            for col, matched in masks.items():
+                sensor_file[matched[rows, cols], col] = best_k[col]
 
+            if self.require_both_inputs:
+                has_geo = (sensor_file[:, geo_cols] >= 0).any(axis=1)
+                has_mw = (sensor_file[:, mw_cols] >= 0).any(axis=1)
+                keep = has_geo & has_mw
+                if not keep.any():
+                    continue
+                cells, sensor_file = cells[keep], sensor_file[keep]
+
+            coords_blocks.append(
+                (cells * OBS_CELL + OBS_CELL // 2).astype(np.int32)
+            )
+            ref_blocks.append(np.full(cells.shape[0], ref_idx, dtype=np.int32))
+            file_blocks.append(sensor_file)
+
+        if coords_blocks:
+            coords = np.concatenate(coords_blocks)
+            ref_file = np.concatenate(ref_blocks)
+            sensor_file = np.concatenate(file_blocks)
+        else:
+            coords = np.empty((0, 2), dtype=np.int32)
+            ref_file = np.empty((0,), dtype=np.int32)
+            sensor_file = np.empty((0, n_sensors), dtype=np.int32)
+
+        samples = _SampleIndex(
+            coords=coords,
+            ref_file=ref_file,
+            sensor_file=sensor_file,
+            sensors=np.array(sensors),
+            groups=groups,
+            filenames={
+                s: np.asarray(inputs[s]["filename"]).astype(str) for s in sensors
+            },
+            ref_filenames=np.asarray(ref["filename"].values).astype(str),
+            norm_stats=self._compute_normalization_stats(),
+        )
         LOGGER.info(
             "Built %d samples from %d reference and %d input stores.",
             len(samples),
             ref_avail.shape[0],
-            sum(info["filename"].shape[0] for info in inputs.values()),
+            sum(inputs[s]["filename"].shape[0] for s in sensors),
         )
+        # The heavy metadata is no longer needed once the compact index is built.
+        for attr in ("geo_meta", "microwave_meta", "reference_meta"):
+            self.__dict__.pop(attr, None)
         return samples
 
     def _sensor_arrays(self, meta: xr.Dataset) -> Dict[str, np.ndarray]:
@@ -999,8 +1134,8 @@ class ArgosTrainingData(Dataset):
     def __getitem__(
         self, index: int
     ) -> Tuple[Dict[str, object], torch.Tensor]:
-        sample = self.samples[index]
-        row_c, col_c = sample["coordinates"]
+        si = self.samples
+        row_c, col_c = int(si.coords[index, 0]), int(si.coords[index, 1])
         latitude, longitude = self._reference_grid
 
         # Randomly jitter the tile center (kept aligned between the input and
@@ -1008,21 +1143,24 @@ class ArgosTrainingData(Dataset):
         obs_size = self.tile_size * RESOLUTION_RATIO
         obs_rows, obs_cols = N_CELLS_LAT * OBS_CELL, N_CELLS_LON * OBS_CELL
         if self.position_jitter > 0:
-            row_c = int(row_c) + RESOLUTION_RATIO * np.random.randint(
+            row_c += RESOLUTION_RATIO * np.random.randint(
                 -self.position_jitter, self.position_jitter + 1
             )
-            col_c = int(col_c) + RESOLUTION_RATIO * np.random.randint(
+            col_c += RESOLUTION_RATIO * np.random.randint(
                 -self.position_jitter, self.position_jitter + 1
             )
-        obs_r0 = min(max(int(row_c) - obs_size // 2, 0), obs_rows - obs_size)
-        obs_c0 = min(max(int(col_c) - obs_size // 2, 0), obs_cols - obs_size)
+        obs_r0 = min(max(row_c - obs_size // 2, 0), obs_rows - obs_size)
+        obs_c0 = min(max(col_c - obs_size // 2, 0), obs_cols - obs_size)
         ref_r0, ref_c0 = obs_r0 // RESOLUTION_RATIO, obs_c0 // RESOLUTION_RATIO
 
         # Reference surface precipitation (the target). The jittered crop can miss
         # the (sparse) valid reference data, so fall back to a random sample if
         # the target has no valid pixel.
+        reference = self._store_path(
+            self.reference_name, si.ref_filenames[si.ref_file[index]]
+        )
         surface_precip = self._load_reference(
-            sample["reference"], ref_r0, ref_c0, self.tile_size
+            reference, ref_r0, ref_c0, self.tile_size
         )
         if not np.isfinite(surface_precip).any():
             return self[np.random.randint(len(self))]
@@ -1032,15 +1170,19 @@ class ArgosTrainingData(Dataset):
         # reference grid. When slotting, the observations are mapped onto the
         # group's common slots; otherwise the raw tensor is returned under the
         # sensor name.
+        sensor_file = si.sensor_file[index]
         obs = {}
-        for group, sensors, loader, (r0, c0, size) in (
-            ("geo", sample["geo"], self._load_obs, (obs_r0, obs_c0, obs_size)),
-            ("mw", sample["mw"], self._load_mw_obs, (ref_r0, ref_c0, self.tile_size)),
+        for group, columns, loader, (r0, c0, size) in (
+            ("geo", si.geo_cols, self._load_obs, (obs_r0, obs_c0, obs_size)),
+            ("mw", si.mw_cols, self._load_mw_obs, (ref_r0, ref_c0, self.tile_size)),
         ):
-            if not sensors:
+            present = columns[sensor_file[columns] >= 0]
+            if present.size == 0:
                 continue
-            sensor = str(np.random.choice(sorted(sensors)))
-            array = loader(sensors[sensor], r0, c0, size)
+            col = int(np.random.choice(present))
+            sensor = str(si.sensors[col])
+            filename = si.filenames[sensor][sensor_file[col]]
+            array = loader(self._store_path(sensor, filename), r0, c0, size)
             if self.normalize:
                 array = self._normalize(array, sensor)
             if self.slot_channels:
@@ -1059,6 +1201,171 @@ class ArgosTrainingData(Dataset):
             ),
         }
         return inputs, torch.from_numpy(surface_precip)
+
+    # ------------------------------------------------------------------
+    # Extraction
+    # ------------------------------------------------------------------
+    def _load_slotted(
+        self, si, index, col, loader, r0: int, c0: int, size: int
+    ) -> np.ndarray:
+        """Load, optionally normalize and slot one sensor's observation crop."""
+        sensor = str(si.sensors[col])
+        filename = si.filenames[sensor][si.sensor_file[index, col]]
+        array = loader(self._store_path(sensor, filename), r0, c0, size)
+        if self.normalize:
+            array = self._normalize(array, sensor)
+        return slot_observations(array, sensor)
+
+    @staticmethod
+    def _filename_time(filename) -> np.datetime64:
+        """Timestamp parsed from a store filename (``NaT`` if absent)."""
+        stamp = _parse_timestamp(Path(str(filename)))
+        return stamp if stamp is not None else np.datetime64("NaT")
+
+    def extract_samples(
+        self,
+        output_path: Union[str, Path],
+        start_time: Optional[Union[str, np.datetime64]] = None,
+        end_time: Optional[Union[str, np.datetime64]] = None,
+    ) -> Path:
+        """
+        Extract fixed-size slotted scenes into a standalone ``.zarr`` store.
+
+        For every sample whose reference time falls within
+        ``[start_time, end_time]`` (both optional), one scene is written per
+        matching input observation: if a sample has several matching
+        geostationary and/or microwave sensors, every combination is written as
+        its own scene. Each scene holds the slotted ``geo`` and ``mw`` inputs and
+        the ``surface_precip`` target at a fixed size, so the resulting store is a
+        self-contained training set that no longer needs the source stores or the
+        metadata indices. Observations are normalized according to ``normalize``
+        and the tile center is randomly jittered by ``position_jitter`` (the
+        stored ``coordinates`` are the jittered center).
+
+        Args:
+            output_path: Path of the output ``.zarr`` store.
+            start_time: Optional lower bound on the sample's reference time
+                (anything ``numpy.datetime64`` accepts).
+            end_time: Optional upper bound on the sample's reference time.
+
+        Returns:
+            The output path.
+        """
+        from numcodecs.zarr3 import Blosc
+
+        output_path = Path(output_path)
+        si = self.samples
+        obs_size = self.tile_size * RESOLUTION_RATIO
+        obs_rows, obs_cols = N_CELLS_LAT * OBS_CELL, N_CELLS_LON * OBS_CELL
+
+        # Sample time = reference granule time (parsed from the filename).
+        ref_times = np.array(
+            [self._filename_time(fn) for fn in si.ref_filenames],
+            dtype="datetime64[ns]",
+        )
+        sample_times = ref_times[si.ref_file]
+        keep = np.ones(len(si), dtype=bool)
+        if start_time is not None:
+            keep &= sample_times >= np.datetime64(start_time)
+        if end_time is not None:
+            keep &= sample_times <= np.datetime64(end_time)
+
+        # Enumerate scenes: one per (geo sensor, mw sensor) combination available.
+        scenes = []  # (sample index, geo column, mw column); -1 = group absent
+        for index in np.where(keep)[0]:
+            sensor_file = si.sensor_file[index]
+            geo = [c for c in si.geo_cols if sensor_file[c] >= 0] or [-1]
+            mw = [c for c in si.mw_cols if sensor_file[c] >= 0] or [-1]
+            for geo_col in geo:
+                for mw_col in mw:
+                    if geo_col < 0 and mw_col < 0:
+                        continue
+                    scenes.append((int(index), int(geo_col), int(mw_col)))
+
+        n_scenes = len(scenes)
+        LOGGER.info(
+            "Extracting %d scenes from %d samples to '%s'.",
+            n_scenes, int(keep.sum()), output_path,
+        )
+
+        compressor = Blosc(cname="zstd", clevel=4)
+        store = zarr.open_group(str(output_path), mode="w")
+        store.attrs["sensors"] = [str(s) for s in si.sensors]
+        store.attrs["groups"] = [str(g) for g in si.groups]
+        store.attrs["tile_size"] = self.tile_size
+        store.attrs["resolution_ratio"] = RESOLUTION_RATIO
+        store.attrs["normalized"] = self.normalize
+        store.attrs["time_units"] = "nanoseconds since 1970-01-01"
+
+        store.create_array(
+            "geo", shape=(n_scenes, N_SLOTS, obs_size, obs_size),
+            chunks=(1, N_SLOTS, obs_size, obs_size), dtype=np.float32,
+            fill_value=np.nan, compressors=compressor,
+            dimension_names=("scene", "geo_channel", "geo_y", "geo_x"),
+        )
+        store.create_array(
+            "mw", shape=(n_scenes, N_MW_SLOTS, self.tile_size, self.tile_size),
+            chunks=(1, N_MW_SLOTS, self.tile_size, self.tile_size), dtype=np.float32,
+            fill_value=np.nan, compressors=compressor,
+            dimension_names=("scene", "mw_channel", "y", "x"),
+        )
+        store.create_array(
+            "surface_precip", shape=(n_scenes, self.tile_size, self.tile_size),
+            chunks=(1, self.tile_size, self.tile_size), dtype=np.float32,
+            fill_value=np.nan, compressors=compressor,
+            dimension_names=("scene", "y", "x"),
+        )
+        store.create_array(
+            "coordinates", shape=(n_scenes, 2), dtype=np.int32,
+            dimension_names=("scene", "row_col"),
+        )
+        store.create_array(
+            "time", shape=(n_scenes,), dtype=np.int64,
+            dimension_names=("scene",),
+        )
+        for name in ("geo_sensor", "mw_sensor"):
+            store.create_array(
+                name, shape=(n_scenes,), dtype=np.int16, fill_value=-1,
+                dimension_names=("scene",),
+            )
+
+        for i, (index, geo_col, mw_col) in enumerate(
+            tqdm(scenes, desc="Extracting scenes", unit="scene")
+        ):
+            row_c, col_c = int(si.coords[index, 0]), int(si.coords[index, 1])
+            if self.position_jitter > 0:
+                row_c += RESOLUTION_RATIO * np.random.randint(
+                    -self.position_jitter, self.position_jitter + 1
+                )
+                col_c += RESOLUTION_RATIO * np.random.randint(
+                    -self.position_jitter, self.position_jitter + 1
+                )
+            obs_r0 = min(max(row_c - obs_size // 2, 0), obs_rows - obs_size)
+            obs_c0 = min(max(col_c - obs_size // 2, 0), obs_cols - obs_size)
+            ref_r0, ref_c0 = obs_r0 // RESOLUTION_RATIO, obs_c0 // RESOLUTION_RATIO
+
+            reference = self._store_path(
+                self.reference_name, si.ref_filenames[si.ref_file[index]]
+            )
+            store["surface_precip"][i] = self._load_reference(
+                reference, ref_r0, ref_c0, self.tile_size
+            )
+            if geo_col >= 0:
+                store["geo"][i] = self._load_slotted(
+                    si, index, geo_col, self._load_obs, obs_r0, obs_c0, obs_size
+                )
+                store["geo_sensor"][i] = geo_col
+            if mw_col >= 0:
+                store["mw"][i] = self._load_slotted(
+                    si, index, mw_col, self._load_mw_obs,
+                    ref_r0, ref_c0, self.tile_size,
+                )
+                store["mw_sensor"][i] = mw_col
+            store["coordinates"][i] = (row_c, col_c)
+            store["time"][i] = sample_times[index].astype("int64")
+
+        LOGGER.info("Wrote %d scenes to '%s'.", n_scenes, output_path)
+        return output_path
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -1133,6 +1440,51 @@ class ArgosTrainingData(Dataset):
         fig.autofmt_xdate()
         fig.tight_layout()
         return fig
+
+
+class ArgosDataset(Dataset):
+    """
+    Dataset of pre-extracted training scenes.
+
+    Loads the fixed-size, slotted scenes written by
+    :meth:`ArgosTrainingData.extract_samples`. Each item is the same
+    ``(inputs, target)`` tuple a model consumes -- ``inputs`` holding the ``geo``
+    and ``mw`` tensors (and the tile ``coordinates``) and ``target`` the
+    ``surface_precip`` tensor. Absent inputs are kept as ``NaN`` so the keys are
+    always present (and batch cleanly); the model treats them as zeros.
+    """
+
+    def __init__(self, path: Union[str, Path]):
+        """
+        Args:
+            path: Path of a ``.zarr`` store written by ``extract_samples``.
+        """
+        super().__init__()
+        self.path = Path(path)
+
+    @cached_property
+    def store(self) -> "zarr.Group":
+        """The (lazily opened) zarr store, opened per process for fork safety."""
+        return zarr.open_group(str(self.path), mode="r")
+
+    @property
+    def sensors(self) -> List[str]:
+        """The sensor names indexed by ``geo_sensor``/``mw_sensor``."""
+        return list(self.store.attrs.get("sensors", []))
+
+    def __len__(self) -> int:
+        return self.store["surface_precip"].shape[0]
+
+    def __getitem__(self, index: int) -> Tuple[Dict[str, object], torch.Tensor]:
+        store = self.store
+        coords = np.asarray(store["coordinates"][index])
+        inputs = {
+            "geo": torch.from_numpy(np.asarray(store["geo"][index])),
+            "mw": torch.from_numpy(np.asarray(store["mw"][index])),
+            "coordinates": (int(coords[0]), int(coords[1])),
+        }
+        target = torch.from_numpy(np.asarray(store["surface_precip"][index]))
+        return inputs, target
 
 
 # Reference surface-precipitation contour levels and their line styles.
