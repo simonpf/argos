@@ -522,42 +522,20 @@ class ArgosTrainingData(Dataset):
         return indices
 
     @cached_property
-    def _geo_indices(self) -> Dict[str, xr.Dataset]:
-        """Per-sensor index datasets of the geostationary inputs."""
-        return self._load_indices(self.input_sensors, self._compute_geo_meta)
-
-    @cached_property
-    def _mw_indices(self) -> Dict[str, xr.Dataset]:
-        """Per-sensor index datasets of the microwave inputs."""
-        return self._load_indices(
-            self.microwave_sensors, self._compute_reference_meta
-        )
-
-    @cached_property
-    def geo_meta(self) -> xr.Dataset:
+    def geo_meta(self) -> Dict[str, xr.Dataset]:
         """
-        Availability and acquisition time of all input stores.
+        Per-sensor availability and acquisition time of the geostationary inputs.
 
-        A single :class:`xarray.Dataset` with the stores of every sensor
-        concatenated along a ``samples`` dimension. It holds ``availability``
-        (``(samples, lat_cell, lon_cell)`` boolean) and ``time`` (``(samples,)``
-        ``datetime64[ns]``), with ``name`` (sensor) and ``path`` coordinates
-        along ``samples`` providing the mapping from sample index to file. The
+        A mapping of sensor name to its own :class:`xarray.Dataset` (kept
+        separate, not concatenated across sensors). Each dataset holds
+        ``availability`` (``(samples, lat_cell, lon_cell)`` boolean), the scalar
+        ``time`` (``(samples,)`` ``datetime64[ns]``), the per-channel
+        ``obs_min``/``obs_max`` statistics and a ``filename`` coordinate (the
+        full store path is built on the fly with :meth:`_store_path`). The
         per-sensor metadata is cached to ``index_<sensor>.nc`` and loaded from
-        there on subsequent runs (see :meth:`recompute_indices` to refresh). The
-        per-channel ``obs_min``/``obs_max`` statistics are dropped here (their
-        channel dimension differs between sensors) and exposed instead through
-        :attr:`normalization_stats`.
+        there on subsequent runs (see :meth:`recompute_indices` to refresh).
         """
-        datasets = [
-            self._attach_name(idx, sensor).drop_vars(
-                ["obs_min", "obs_max"], errors="ignore"
-            )
-            for sensor, idx in self._geo_indices.items()
-        ]
-        if not datasets:
-            raise FileNotFoundError("No input '.zarr' stores found.")
-        return xr.concat(datasets, dim="samples")
+        return self._load_indices(self.input_sensors, self._compute_geo_meta)
 
     def _compute_geo_meta(self, sensor: str, files: List[Path]) -> xr.Dataset:
         """Read the availability and acquisition time of one sensor's stores."""
@@ -618,57 +596,40 @@ class ArgosTrainingData(Dataset):
     @cached_property
     def reference_meta(self) -> xr.Dataset:
         """
-        Availability and per-cell scan time of all reference stores.
+        Availability and per-cell scan time of the reference stores.
 
-        A single :class:`xarray.Dataset` with the reference stores concatenated
-        along a ``samples`` dimension. It holds ``availability``
-        (``(samples, lat_cell, lon_cell)`` boolean) and ``time``
+        A single :class:`xarray.Dataset` (the reference is one dataset) holding
+        ``availability`` (``(samples, lat_cell, lon_cell)`` boolean), ``time``
         (``(samples, lat_cell, lon_cell)`` ``datetime64[ns]``, ``NaT`` where no
-        data was observed), with ``name`` and ``path`` coordinates along
-        ``samples`` providing the mapping from sample index to file. The metadata
-        is cached to ``index_<reference_name>.nc`` and loaded from there on
-        subsequent runs (see :meth:`recompute_indices` to refresh).
+        data was observed) and a ``filename`` coordinate. Cached to
+        ``index_<reference_name>.nc`` (see :meth:`recompute_indices`).
         """
-        datasets = []
-        for name in (self.reference_name,):
-            meta = self._read_index(name)
-            if meta is None:
-                files = self._list_stores(name)
-                if not files:
-                    raise FileNotFoundError(
-                        f"No reference '.zarr' stores found in "
-                        f"'{self.path / name}'."
-                    )
-                meta = self._compute_reference_meta(name, files)
-                self._write_index(name, meta)
-            datasets.append(self._attach_name(meta, name))
-        datasets = [ds for ds in datasets if ds.sizes["samples"] > 0]
-        if not datasets:
+        name = self.reference_name
+        meta = self._read_index(name)
+        if meta is None:
+            files = self._list_stores(name)
+            if not files:
+                raise FileNotFoundError(
+                    f"No reference '.zarr' stores found in '{self.path / name}'."
+                )
+            meta = self._compute_reference_meta(name, files)
+            self._write_index(name, meta)
+        if meta.sizes["samples"] == 0:
             raise FileNotFoundError("No reference '.zarr' stores found.")
-        return xr.concat(datasets, dim="samples")
+        return meta
 
     @cached_property
-    def microwave_meta(self) -> xr.Dataset:
+    def microwave_meta(self) -> Dict[str, xr.Dataset]:
         """
-        Availability and per-cell scan time of all microwave stores.
+        Per-sensor availability and per-cell scan time of the microwave inputs.
 
-        Like :attr:`reference_meta` (the microwave data is on the reference grid
-        with a per-cell scan time), but with the stores of every microwave sensor
-        concatenated along ``samples`` and ``name``/``path`` coordinates for the
-        sample-index-to-file mapping. Returns an empty dataset if there are no
-        microwave stores. Cached per sensor to ``index_<sensor>.nc``. Per-channel
-        ``obs_min``/``obs_max`` statistics are exposed via
-        :attr:`normalization_stats`.
+        Like :attr:`geo_meta`, but each per-sensor dataset has a per-cell ``time``
+        (``(samples, lat_cell, lon_cell)``, ``NaT`` where no data was observed)
+        on the reference grid. Empty if there are no microwave stores.
         """
-        datasets = [
-            self._attach_name(idx, sensor).drop_vars(
-                ["obs_min", "obs_max"], errors="ignore"
-            )
-            for sensor, idx in self._mw_indices.items()
-        ]
-        if not datasets:
-            return self._attach_name(self._compute_reference_meta("", []), "")
-        return xr.concat(datasets, dim="samples")
+        return self._load_indices(
+            self.microwave_sensors, self._compute_reference_meta
+        )
 
     @cached_property
     def normalization_stats(self) -> Dict[str, Dict[str, np.ndarray]]:
@@ -682,7 +643,7 @@ class ArgosTrainingData(Dataset):
         ``normalize`` is enabled.
         """
         stats = {}
-        for sensor, idx in {**self._geo_indices, **self._mw_indices}.items():
+        for sensor, idx in {**self.geo_meta, **self.microwave_meta}.items():
             if "obs_min" not in idx:
                 continue
             # A channel that was never observed yields an all-NaN slice (and a
@@ -752,15 +713,6 @@ class ArgosTrainingData(Dataset):
             coords={"filename": ("samples", np.array(names, dtype=object))},
         )
 
-    def _attach_name(self, meta: xr.Dataset, name: str) -> xr.Dataset:
-        """Add the ``name`` (sensor) coordinate to a per-name index.
-
-        The full store path is not stored; it is reconstructed on the fly from
-        the ``name`` and ``filename`` coordinates (see :meth:`_store_path`).
-        """
-        n = meta.sizes["samples"]
-        return meta.assign_coords(name=("samples", np.full(n, name, dtype=object)))
-
     @staticmethod
     def _as_str(value) -> str:
         """Coerce a coordinate value to a plain ``str`` (decoding bytes)."""
@@ -822,8 +774,8 @@ class ArgosTrainingData(Dataset):
                 path.unlink()
                 LOGGER.info("Removed cached index '%s'.", path)
         for attr in (
-            "_geo_indices", "_mw_indices", "geo_meta", "microwave_meta",
-            "reference_meta", "normalization_stats", "samples",
+            "geo_meta", "microwave_meta", "reference_meta",
+            "normalization_stats", "samples",
         ):
             self.__dict__.pop(attr, None)
         # Trigger recomputation (and re-caching) of the metadata.
@@ -836,7 +788,7 @@ class ArgosTrainingData(Dataset):
         """The (latitude, longitude) arrays of the global reference grid."""
         ref = self.reference_meta
         first = self._store_path(
-            ref["name"].values[0], ref["filename"].values[0]
+            self.reference_name, ref["filename"].values[0]
         )
         store = zarr.open_group(str(first), mode="r")
         return (
@@ -871,14 +823,13 @@ class ArgosTrainingData(Dataset):
         # Per-sensor input arrays (geo and microwave), with a per-file time span
         # used to pre-filter candidates.
         inputs = {
-            **self._input_arrays(self.geo_meta),
-            **self._input_arrays(self.microwave_meta),
+            sensor: self._sensor_arrays(meta)
+            for sensor, meta in {**self.geo_meta, **self.microwave_meta}.items()
         }
 
         ref = self.reference_meta
         ref_avail = ref["availability"].values.astype(bool)
         ref_time = ref["time"].values
-        ref_name = ref["name"].values
         ref_filename = ref["filename"].values
 
         samples: List[Dict[str, object]] = []
@@ -945,7 +896,7 @@ class ArgosTrainingData(Dataset):
                         "geo": geo,
                         "mw": mw,
                         "reference": self._store_path(
-                            ref_name[ref_idx], ref_filename[ref_idx]
+                            self.reference_name, ref_filename[ref_idx]
                         ),
                     }
                 )
@@ -958,47 +909,36 @@ class ArgosTrainingData(Dataset):
         )
         return samples
 
-    def _input_arrays(self, meta: xr.Dataset) -> Dict[str, Dict[str, np.ndarray]]:
+    def _sensor_arrays(self, meta: xr.Dataset) -> Dict[str, np.ndarray]:
         """
-        Group a metadata dataset into per-sensor matching arrays.
+        Convert one sensor's metadata into matching arrays.
 
-        Returns, per sensor, the ``availability`` ``(n, 90, 180)`` and ``time``
-        (``(n,)`` for geo or ``(n, 90, 180)`` for microwave) arrays, the
-        ``filename`` array (``str``; the full path is built on the fly via
-        :meth:`_store_path`), and the per-file time span (``tmin``/``tmax``) used
-        to pre-filter candidates.
+        Returns the ``availability`` ``(n, 90, 180)`` and ``time`` (``(n,)`` for
+        geo or ``(n, 90, 180)`` for microwave) arrays, the ``filename`` array
+        (``str``; the full path is built on the fly via :meth:`_store_path`), and
+        the per-file time span (``tmin``/``tmax``) used to pre-filter candidates.
         """
-        if meta.sizes["samples"] == 0:
-            return {}
         availability = meta["availability"].values.astype(bool)
         time = meta["time"].values
         filename = meta["filename"].values
-        name = meta["name"].values
-
-        result: Dict[str, Dict[str, np.ndarray]] = {}
-        for sensor in dict.fromkeys(name.tolist()):
-            sel = np.where(name == sensor)[0]
-            s_time = time[sel]
-            if s_time.ndim == 1:
-                # Geostationary: a single acquisition time per file.
-                tmin = tmax = s_time
-            else:
-                # Microwave/reference: a per-cell scan time, reduced per file.
-                s_avail = availability[sel]
-                tmin = np.full(len(sel), np.datetime64("NaT"), dtype="datetime64[ns]")
-                tmax = tmin.copy()
-                for i in range(len(sel)):
-                    valid = s_time[i][s_avail[i] & ~np.isnat(s_time[i])]
-                    if valid.size:
-                        tmin[i], tmax[i] = valid.min(), valid.max()
-            result[str(sensor)] = {
-                "availability": availability[sel],
-                "time": s_time,
-                "filename": filename[sel],
-                "tmin": tmin,
-                "tmax": tmax,
-            }
-        return result
+        if time.ndim == 1:
+            # Geostationary: a single acquisition time per file.
+            tmin = tmax = time
+        else:
+            # Microwave/reference: a per-cell scan time, reduced per file.
+            tmin = np.full(len(time), np.datetime64("NaT"), dtype="datetime64[ns]")
+            tmax = tmin.copy()
+            for i in range(len(time)):
+                valid = time[i][availability[i] & ~np.isnat(time[i])]
+                if valid.size:
+                    tmin[i], tmax[i] = valid.min(), valid.max()
+        return {
+            "availability": availability,
+            "time": time,
+            "filename": filename,
+            "tmin": tmin,
+            "tmax": tmax,
+        }
 
     # ------------------------------------------------------------------
     # Sample loading
@@ -1153,21 +1093,12 @@ class ArgosTrainingData(Dataset):
         """
         import matplotlib.pyplot as plt
 
-        # Per-dataset arrays of per-file days, for every input group and the
+        # Per-dataset arrays of per-file days, for every input sensor and the
         # reference.
         days_per_dataset: Dict[str, np.ndarray] = {}
-        for meta, sensors in (
-            (self.geo_meta, self.input_sensors),
-            (self.microwave_meta, self.microwave_sensors),
-        ):
-            if meta.sizes["samples"] == 0:
-                continue
-            names = meta["name"].values
-            days = self._file_days(meta)
-            for sensor in sensors:
-                mask = names == sensor
-                if mask.any():
-                    days_per_dataset[sensor] = days[mask]
+        for meta_by_sensor in (self.geo_meta, self.microwave_meta):
+            for sensor, meta in meta_by_sensor.items():
+                days_per_dataset[sensor] = self._file_days(meta)
         days_per_dataset[self.reference_name] = self._file_days(self.reference_meta)
 
         # Common, contiguous range of days.
