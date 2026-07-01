@@ -32,6 +32,9 @@ from pansat.products.satellite.gpm import (
     l1c_xcal2021v_f18_ssmis_v07a,
     l1c_xcal2021v_f18_ssmis_v07b,
     l1c_xcal2021v_f19_ssmis_v07a,
+    l1c_xcal2025n_tropics03_tms_parv804,
+    l1c_xcal2025n_tropics05_tms_parv804,
+    l1c_xcal2025n_tropics06_tms_parv804,
     l2a_gprof_gpm_gmi_v08a,
     l2a_gprof_gcomw1_amsr2_v08a
 )
@@ -539,6 +542,39 @@ f19_ssmis_obs = GPMObs(
     channel_properties=_SSMIS_CHANNEL_PROPERTIES,
 )
 
+# TROPICS Microwave Sounder (TMS): the cross-calibrated L1C product carries five
+# channels in three swaths -- a 91.655 GHz window channel (S1), the 184/186/190
+# GHz water-vapor channels (S2) and the 204.8 GHz channel (S3). The polarization
+# is quasi-vertical (only the 204.8 GHz channel reports it explicitly).
+_TMS_CHANNEL_PROPERTIES = {
+    (1, 0): MWChannelProperties(91.655, 2700.0, 1.4, "QV"),
+    (2, 0): MWChannelProperties(184.41, 2000.0, 0.0, "QV"),
+    (2, 1): MWChannelProperties(186.51, 2000.0, 0.0, "QV"),
+    (2, 2): MWChannelProperties(190.31, 2200.0, 0.0, "QV"),
+    (3, 0): MWChannelProperties(204.80, 2000.0, 0.0, "QV"),
+}
+
+tropics03_tms_obs = GPMObs(
+    name="tropics03_tms",
+    products=[l1c_xcal2025n_tropics03_tms_parv804],
+    radius_of_influence=30e3,
+    channel_properties=_TMS_CHANNEL_PROPERTIES,
+)
+
+tropics05_tms_obs = GPMObs(
+    name="tropics05_tms",
+    products=[l1c_xcal2025n_tropics05_tms_parv804],
+    radius_of_influence=30e3,
+    channel_properties=_TMS_CHANNEL_PROPERTIES,
+)
+
+tropics06_tms_obs = GPMObs(
+    name="tropics06_tms",
+    products=[l1c_xcal2025n_tropics06_tms_parv804],
+    radius_of_influence=30e3,
+    channel_properties=_TMS_CHANNEL_PROPERTIES,
+)
+
 
 class GPMRefData:
     """
@@ -662,28 +698,28 @@ class GPMRefData:
                         shape=(1,),
                         dtype=np.float32,
                         fill_value=np.nan,
-                        dimension_names=None
+                        dimension_names=(),
                     )
                     store.create_array(
                         'surface_precip_max',
                         shape=(1,),
                         dtype=np.float32,
                         fill_value=np.nan,
-                        dimension_names=None
+                        dimension_names=(),
                     )
                     store.create_array(
                         'surface_precip_sum',
                         shape=(1,),
                         dtype=np.float32,
                         fill_value=np.nan,
-                        dimension_names=None
+                        dimension_names=(),
                     )
                     store.create_array(
                         'surface_precip_cts',
                         shape=(1,),
                         dtype=np.int32,
                         fill_value=0,
-                        dimension_names=None
+                        dimension_names=()
                     )
 
                     # Store availability

@@ -29,6 +29,9 @@ from argos.data.gpm import (
     metopb_mhs_obs,
     metopc_mhs_obs,
     noaa20_atms_obs,
+    tropics03_tms_obs,
+    tropics05_tms_obs,
+    tropics06_tms_obs,
 )
 
 
@@ -44,10 +47,13 @@ SENSORS = {
     'npp_atms': npp_atms_obs,
     'noaa18_mhs': noaa18_mhs_obs,
     'noaa19_mhs': noaa19_mhs_obs,
-    'metopa_mhs_obs': metopa_mhs_obs,
-    'metopb_mhs_obs': metopb_mhs_obs,
-    'metopc_mhs_obs': metopc_mhs_obs,
+    'metopa_mhs': metopa_mhs_obs,
+    'metopb_mhs': metopb_mhs_obs,
+    'metopc_mhs': metopc_mhs_obs,
     'noaa20_atms': noaa20_atms_obs,
+    'tropics03_tms': tropics03_tms_obs,
+    'tropics05_tms': tropics05_tms_obs,
+    'tropics06_tms': tropics06_tms_obs,
     'gprof_gmi': gpm_gmi_ref,
     'gprof_amsr2': gpm_amsr2_ref,
 }
