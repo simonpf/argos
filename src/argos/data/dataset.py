@@ -45,6 +45,8 @@ import warnings
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms.v2 import functional as tv_functional
 from tqdm import tqdm
 import xarray as xr
 import zarr
@@ -389,6 +391,8 @@ class _SampleIndex:
 
     * ``coords`` ``(n, 2)`` int32 -- full-resolution ``(row, column)`` cell center
     * ``ref_file`` ``(n,)`` int32 -- index into ``ref_filenames``
+    * ``ref_time`` ``(n,)`` datetime64 -- the reference cell's scan time (from the
+      per-cell time field, *not* the granule filename, which can be ~90 min off)
     * ``sensor_file`` ``(n, S)`` int32 -- per-sensor file index, ``-1`` if the
       sensor has no matching data at the sample
     * ``sensors`` ``(S,)`` / ``groups`` ``(S,)`` -- column sensor names and their
@@ -402,6 +406,7 @@ class _SampleIndex:
         self,
         coords: np.ndarray,
         ref_file: np.ndarray,
+        ref_time: np.ndarray,
         sensor_file: np.ndarray,
         sensors: np.ndarray,
         groups: np.ndarray,
@@ -411,6 +416,7 @@ class _SampleIndex:
     ):
         self.coords = coords
         self.ref_file = ref_file
+        self.ref_time = ref_time
         self.sensor_file = sensor_file
         self.sensors = sensors
         self.groups = groups
@@ -427,6 +433,7 @@ class _SampleIndex:
         arrays = {
             "coords": self.coords,
             "ref_file": self.ref_file,
+            "ref_time": self.ref_time,
             "sensor_file": self.sensor_file,
             "sensors": self.sensors,
             "groups": self.groups,
@@ -455,6 +462,7 @@ class _SampleIndex:
             return cls(
                 coords=cache["coords"],
                 ref_file=cache["ref_file"],
+                ref_time=cache["ref_time"],
                 sensor_file=cache["sensor_file"],
                 sensors=sensors,
                 groups=cache["groups"],
@@ -900,6 +908,7 @@ class ArgosTrainingData(Dataset):
         """Path of the on-disk sample-index cache (keyed by the relevant config)."""
         key = "|".join(
             [
+                "v2",  # cache format version (bump to invalidate old caches)
                 ",".join(self.input_sensors),
                 ",".join(self.microwave_sensors),
                 self.reference_name,
@@ -950,7 +959,7 @@ class ArgosTrainingData(Dataset):
         ref_avail = ref["availability"].values.astype(bool)
         ref_time = ref["time"].values
 
-        coords_blocks, ref_blocks, file_blocks = [], [], []
+        coords_blocks, ref_blocks, file_blocks, time_blocks = [], [], [], []
         for ref_idx in tqdm(
             range(ref_avail.shape[0]), desc="Building samples", unit="granule"
         ):
@@ -1011,19 +1020,24 @@ class ArgosTrainingData(Dataset):
             )
             ref_blocks.append(np.full(cells.shape[0], ref_idx, dtype=np.int32))
             file_blocks.append(sensor_file)
+            # The reference cell's actual scan time (not the granule filename).
+            time_blocks.append(r_time[cells[:, 0], cells[:, 1]])
 
         if coords_blocks:
             coords = np.concatenate(coords_blocks)
             ref_file = np.concatenate(ref_blocks)
             sensor_file = np.concatenate(file_blocks)
+            ref_time = np.concatenate(time_blocks)
         else:
             coords = np.empty((0, 2), dtype=np.int32)
             ref_file = np.empty((0,), dtype=np.int32)
             sensor_file = np.empty((0, n_sensors), dtype=np.int32)
+            ref_time = np.empty((0,), dtype="datetime64[ns]")
 
         samples = _SampleIndex(
             coords=coords,
             ref_file=ref_file,
+            ref_time=ref_time,
             sensor_file=sensor_file,
             sensors=np.array(sensors),
             groups=groups,
@@ -1239,6 +1253,16 @@ class ArgosTrainingData(Dataset):
         ref_r0, ref_c0 = obs_r0 // RESOLUTION_RATIO, obs_c0 // RESOLUTION_RATIO
         return row_c, col_c, obs_r0, obs_c0, ref_r0, ref_c0
 
+    @staticmethod
+    def _subsample(scenes, sampling_rate):
+        """Randomly keep a fraction ``sampling_rate`` of the enumerated scenes."""
+        if sampling_rate >= 1.0:
+            return scenes
+        if not 0.0 < sampling_rate <= 1.0:
+            raise ValueError("sampling_rate must be in (0, 1].")
+        keep = np.random.random(len(scenes)) < sampling_rate
+        return [scene for scene, take in zip(scenes, keep) if take]
+
     def _enumerate_scenes(self, start_time, end_time):
         """
         Select samples within ``[start_time, end_time]`` and expand them into
@@ -1247,11 +1271,9 @@ class ArgosTrainingData(Dataset):
         the scene list and the per-sample reference times.
         """
         si = self.samples
-        ref_times = np.array(
-            [self._filename_time(fn) for fn in si.ref_filenames],
-            dtype="datetime64[ns]",
-        )
-        sample_times = ref_times[si.ref_file]
+        # The reference cell's actual scan time (per-cell, not the granule
+        # filename time which can be ~90 min off within an orbit).
+        sample_times = si.ref_time
         keep = np.ones(len(si), dtype=bool)
         if start_time is not None:
             keep &= sample_times >= np.datetime64(start_time)
@@ -1377,6 +1399,7 @@ class ArgosTrainingData(Dataset):
     def extract_samples(
         self,
         output_path: Union[str, Path],
+        sampling_rate: float = 1.0,
         start_time: Optional[Union[str, np.datetime64]] = None,
         end_time: Optional[Union[str, np.datetime64]] = None,
     ) -> Path:
@@ -1396,6 +1419,8 @@ class ArgosTrainingData(Dataset):
 
         Args:
             output_path: Path of the output ``.zarr`` store.
+            sampling_rate: Fraction in ``(0, 1]`` of the enumerated scenes to
+                extract, each kept independently at random (default 1.0 = all).
             start_time: Optional lower bound on the sample's reference time
                 (anything ``numpy.datetime64`` accepts).
             end_time: Optional upper bound on the sample's reference time.
@@ -1404,6 +1429,7 @@ class ArgosTrainingData(Dataset):
             The output path.
         """
         scenes, sample_times = self._enumerate_scenes(start_time, end_time)
+        scenes = self._subsample(scenes, sampling_rate)
         return self._write_scenes(output_path, scenes, sample_times)
 
     def extract_temporal_samples(
@@ -1412,6 +1438,8 @@ class ArgosTrainingData(Dataset):
         n_steps: int,
         step: np.timedelta64 = np.timedelta64(20, "m"),
         tolerance: Optional[np.timedelta64] = None,
+        sampling_rate: float = 1.0,
+        require_microwave: bool = True,
         start_time: Optional[Union[str, np.datetime64]] = None,
         end_time: Optional[Union[str, np.datetime64]] = None,
     ) -> Path:
@@ -1445,6 +1473,10 @@ class ArgosTrainingData(Dataset):
             step: Time between slots (``numpy.timedelta64``; default 20 minutes).
             tolerance: Maximum offset between an observation and a slot time for it
                 to fill the slot (default ``step / 2``).
+            sampling_rate: Fraction in ``(0, 1]`` of the enumerated scenes to
+                extract, each kept independently at random (default 1.0 = all).
+            require_microwave: If ``True`` (the default), only keep scenes that
+                have a microwave observation in at least one slot.
             start_time: Optional lower bound on the sample's reference time.
             end_time: Optional upper bound on the sample's reference time.
 
@@ -1464,11 +1496,8 @@ class ArgosTrainingData(Dataset):
         sensor_column = {str(s): i for i, s in enumerate(si.sensors)}
 
         # Filter by reference time and enumerate one scene per available geo sensor.
-        ref_times = np.array(
-            [self._filename_time(fn) for fn in si.ref_filenames],
-            dtype="datetime64[ns]",
-        )
-        sample_times = ref_times[si.ref_file]
+        # ``ref_time`` is the reference cell's actual (per-cell) scan time.
+        sample_times = si.ref_time
         keep = np.ones(len(si), dtype=bool)
         if start_time is not None:
             keep &= sample_times >= np.datetime64(start_time)
@@ -1480,7 +1509,7 @@ class ArgosTrainingData(Dataset):
             for col in si.geo_cols
             if si.sensor_file[index, col] >= 0
         ]
-        n_scenes = len(scenes)
+        scenes = self._subsample(scenes, sampling_rate)
 
         # Acquisition time of every geo store (geostationary obs are instantaneous,
         # so the filename timestamp is the frame time).
@@ -1497,6 +1526,37 @@ class ArgosTrainingData(Dataset):
             for idx, _ in scenes
         }
         mw_by_cell = self._mw_observations_by_cell(cells, sensor_column)
+
+        # For each scene compute its time grid (anchored at the matched geo
+        # observation) and the microwave observation assigned to each slot (the
+        # nearest from any sensor within ``tolerance``). Scenes with no microwave
+        # observation in any slot are dropped when ``require_microwave`` is set.
+        records = []  # (index, geo_col, slot_times, mw_assignment)
+        for index, geo_col in scenes:
+            geo_sensor = str(si.sensors[geo_col])
+            anchor = geo_times[geo_sensor][int(si.sensor_file[index, geo_col])]
+            slot_times = [anchor - (n_steps - s) * step for s in range(frames)]
+            cell = (
+                int(si.coords[index, 0]) // OBS_CELL,
+                int(si.coords[index, 1]) // OBS_CELL,
+            )
+            candidates = mw_by_cell.get(cell, [])
+            mw_assignment = []
+            for slot in slot_times:
+                best_column, best_filename, best_offset = -1, None, tolerance
+                for scan_time, column, filename in candidates:
+                    offset = abs(scan_time - slot)
+                    if offset <= best_offset:
+                        best_column, best_filename, best_offset = (
+                            column, filename, offset
+                        )
+                mw_assignment.append((best_column, best_filename))
+            if require_microwave and not any(
+                filename is not None for _, filename in mw_assignment
+            ):
+                continue
+            records.append((index, geo_col, slot_times, mw_assignment))
+        n_scenes = len(records)
 
         LOGGER.info(
             "Extracting %d temporal scenes (%d steps) to '%s'.",
@@ -1551,15 +1611,11 @@ class ArgosTrainingData(Dataset):
             dimension_names=("scene", "step"),
         )
 
-        for i, (index, geo_col) in enumerate(
-            tqdm(scenes, desc="Extracting scenes", unit="scene")
+        for i, (index, geo_col, slot_times, mw_assignment) in enumerate(
+            tqdm(records, desc="Extracting scenes", unit="scene")
         ):
             row_c, col_c, obs_r0, obs_c0, ref_r0, ref_c0 = self._scene_windows(
                 si, index
-            )
-            cell = (
-                int(si.coords[index, 0]) // OBS_CELL,
-                int(si.coords[index, 1]) // OBS_CELL,
             )
             store["surface_precip"][i] = self._load_reference(
                 self._store_path(
@@ -1570,17 +1626,13 @@ class ArgosTrainingData(Dataset):
             store["coordinates"][i] = (row_c, col_c)
             store["time"][i] = sample_times[index].astype("int64")
             store["geo_sensor"][i] = geo_col
-
-            # Regular grid anchored at the matched geo observation time.
-            geo_sensor = str(si.sensors[geo_col])
-            gt = geo_times[geo_sensor]
-            anchor = gt[int(si.sensor_file[index, geo_col])]
-            slot_times = [anchor - (n_steps - s) * step for s in range(frames)]
             store["step_time"][i] = np.array(
                 [t.astype("int64") for t in slot_times], dtype=np.int64
             )
 
             # geo: nearest store of the chosen sensor to each slot time.
+            geo_sensor = str(si.sensors[geo_col])
+            gt = geo_times[geo_sensor]
             geo_scene = np.full(
                 (N_SLOTS, frames, obs_size, obs_size), np.nan, dtype=np.float32
             )
@@ -1596,31 +1648,23 @@ class ArgosTrainingData(Dataset):
                     geo_scene[:, s] = slot_observations(array, geo_sensor)
             store["geo"][i] = geo_scene
 
-            # mw: nearest microwave observation from any sensor to each slot time.
-            candidates = mw_by_cell.get(cell, [])
+            # mw: the pre-assigned microwave observation (any sensor) per slot.
             mw_scene = np.full(
                 (N_MW_SLOTS, frames, self.tile_size, self.tile_size),
                 np.nan, dtype=np.float32,
             )
             mw_sensor = np.full(frames, -1, dtype=np.int16)
-            for s, slot in enumerate(slot_times):
-                best_column, best_filename, best_offset = -1, None, tolerance
-                for scan_time, column, filename in candidates:
-                    offset = abs(scan_time - slot)
-                    if offset <= best_offset:
-                        best_column, best_filename, best_offset = (
-                            column, filename, offset
-                        )
-                if best_filename is not None:
-                    sensor = str(si.sensors[best_column])
+            for s, (column, filename) in enumerate(mw_assignment):
+                if filename is not None:
+                    sensor = str(si.sensors[column])
                     array = self._load_mw_obs(
-                        self._store_path(sensor, best_filename),
+                        self._store_path(sensor, filename),
                         ref_r0, ref_c0, self.tile_size,
                     )
                     if self.normalize:
                         array = self._normalize(array, sensor)
                     mw_scene[:, s] = slot_observations(array, sensor)
-                    mw_sensor[s] = best_column
+                    mw_sensor[s] = column
             store["mw"][i] = mw_scene
             store["mw_sensor"][i] = mw_sensor
 
@@ -1712,15 +1756,39 @@ class ArgosDataset(Dataset):
     and ``mw`` tensors (and the tile ``coordinates``) and ``target`` the
     ``surface_precip`` tensor. Absent inputs are kept as ``NaN`` so the keys are
     always present (and batch cleanly); the model treats them as zeros.
+
+    With ``augment=True`` a random affine transform (rotation, isotropic scaling
+    and shear) is drawn per item and applied identically to ``geo``, ``mw`` and
+    the target, so they stay co-registered. Resampling is NaN-aware: missing
+    pixels do not bleed into valid ones and stay ``NaN``.
     """
 
-    def __init__(self, path: Union[str, Path]):
+    def __init__(
+        self,
+        path: Union[str, Path],
+        augment: bool = False,
+        rotation: Tuple[float, float] = (-180.0, 180.0),
+        scale: Tuple[float, float] = (0.8, 1.2),
+        shear: Tuple[float, float] = (-15.0, 15.0),
+    ):
         """
         Args:
             path: Path of a ``.zarr`` store written by ``extract_samples``.
+            augment: If ``True``, apply a random affine augmentation to each item.
+            rotation: Range (degrees) for the random rotation.
+            scale: Range for the random isotropic scale factor.
+            shear: Range (degrees) for the random x/y shear.
         """
         super().__init__()
         self.path = Path(path)
+        self.augment = bool(augment)
+        self.rotation = rotation
+        self.scale = scale
+        self.shear = shear
+
+    # ``DataLoader(worker_init_fn=...)`` helper to seed NumPy per worker (the
+    # augmentation uses ``numpy.random``).
+    worker_init_fn = staticmethod(worker_init_fn)
 
     @cached_property
     def store(self) -> "zarr.Group":
@@ -1735,15 +1803,72 @@ class ArgosDataset(Dataset):
     def __len__(self) -> int:
         return self.store["surface_precip"].shape[0]
 
+    def _sample_affine_params(self) -> Dict[str, object]:
+        """Draw random affine parameters (rotation, scale, x/y shear)."""
+        return {
+            "angle": float(np.random.uniform(*self.rotation)),
+            "scale": float(np.random.uniform(*self.scale)),
+            "shear": [
+                float(np.random.uniform(*self.shear)),
+                float(np.random.uniform(*self.shear)),
+            ],
+        }
+
+    @staticmethod
+    def _apply_affine(tensor: torch.Tensor, params: Dict[str, object]) -> torch.Tensor:
+        """
+        Apply an affine transform to a spatial tensor about its center.
+
+        Uses nearest-neighbor resampling, so values are copied rather than
+        blended: ``NaN`` pixels stay ``NaN`` and never contaminate valid
+        neighbours. Samples that fall outside the input (e.g. the corners exposed
+        by a rotation) are filled with ``NaN`` via ``fill``, so no separate
+        validity mask is needed. Leading channel/step dimensions are flattened;
+        the transform acts on the trailing ``(H, W)`` axes.
+        """
+        shape = tensor.shape
+        height, width = shape[-2], shape[-1]
+        x = tensor.reshape(1, -1, height, width).float()
+        out = tv_functional.affine(
+            x,
+            angle=params["angle"],
+            translate=[0, 0],
+            scale=params["scale"],
+            shear=params["shear"],
+            interpolation=InterpolationMode.NEAREST,
+            fill=float("nan"),
+        )
+        return out.reshape(shape)
+
     def __getitem__(self, index: int) -> Tuple[Dict[str, object], torch.Tensor]:
         store = self.store
         coords = np.asarray(store["coordinates"][index])
+        geo = torch.from_numpy(np.asarray(store["geo"][index]))
+        mw = torch.from_numpy(np.asarray(store["mw"][index]))
+        target = torch.from_numpy(np.asarray(store["surface_precip"][index]))
+
+        # Skip samples without any valid reference data by falling back to a
+        # randomly drawn sample.
+        if not bool(torch.isfinite(target).any()):
+            LOGGER.warning(
+                "Sample %d has no valid surface_precip values; drawing a "
+                "random replacement sample.",
+                index,
+            )
+            return self[np.random.randint(len(self))]
+
+        if self.augment:
+            # One transform per item, applied to every field so they stay aligned.
+            params = self._sample_affine_params()
+            geo = self._apply_affine(geo, params)
+            mw = self._apply_affine(mw, params)
+            target = self._apply_affine(target, params)
+
         inputs = {
-            "geo": torch.from_numpy(np.asarray(store["geo"][index])),
-            "mw": torch.from_numpy(np.asarray(store["mw"][index])),
+            "geo": geo,
+            "mw": mw,
             "coordinates": (int(coords[0]), int(coords[1])),
         }
-        target = torch.from_numpy(np.asarray(store["surface_precip"][index]))
         return inputs, target
 
 
