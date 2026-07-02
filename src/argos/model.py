@@ -81,8 +81,81 @@ def channel_dropout(
     mask_shape = x.shape[:2] + (1,) * (x.ndim - 2)
     mask = (
         p < torch.rand(mask_shape, device=x.device)
-    ).to(dtype=x.dtype)
-    return x * mask
+    )
+    return torch.where(mask, x, torch.nan)
+
+
+def batch_dropout(
+    x: torch.Tensor,
+    p: float,
+    training: bool = True,
+) -> torch.Tensor:
+    """Drop complete input channels independently for each sample."""
+    if not training or p == 0.0:
+        return x
+    if not 0.0 <= p < 1.0:
+        raise ValueError("p must satisfy 0 <= p < 1")
+
+    mask_shape = x.shape[:1] + (1,) * (x.ndim - 1)
+    mask = (
+        p < torch.rand(mask_shape, device=x.device)
+    )
+    return torch.where(mask, x, torch.nan)
+
+
+class TemporalFusion(nn.Module):
+    def __init__(
+            self,
+            chans_in: int,
+            times_in: int,
+            times_out: int,
+            channel_expansion: int = 1,
+            time_expansion: int = 2
+    ):
+        super().__init__()
+        self.in_channels = chans_in
+        self.hidden_channels = channel_expansion * self.in_channels
+        self.in_times = times_in
+        self.hidden_times = times_out * time_expansion
+        self.out_times = times_out
+
+        self.channel_expansion = nn.Linear(self.in_channels, self.hidden_channels)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(self.in_times, self.hidden_times),
+            nn.LayerNorm(self.hidden_times),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.hidden_times, self.out_times),
+        )
+        self.channel_mlp = nn.Sequential(
+            nn.Linear(self.hidden_channels, self.hidden_channels),
+            nn.LayerNorm(self.hidden_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.hidden_channels, self.in_channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+
+        BT, C, H, W = x.shape
+        x = x.reshape(BT // self.in_times, self.in_times, C, H, W)
+        shortcut = x
+
+        # Order: B, T, H, W, C
+        x = x.permute((0, 1, 3, 4, 2))
+        x = self.channel_expansion(x)
+
+        # Order: B, C, H, W, T
+        x = x.permute((0, 4, 2, 3, 1))
+        x = self.time_mlp(x)
+
+        # Order: B, T, H, W, C
+        x = x.permute((0, 4, 2, 3, 1))
+        x = self.channel_mlp(x)
+
+        # Order: B, T, H, W, C
+        x = x.permute((0, 1, 4, 2, 3))
+
+        x = x + shortcut[:, :self.out_times]
+        return x.flatten(0, 1)
 
 
 class ResNeXtBlock(nn.Module):
@@ -100,6 +173,8 @@ class ResNeXtBlock(nn.Module):
             out_channels: int,
             cardinality: int = 8,
             stride: int = 1,
+            times_in: Optional[int] = None,
+            times_out: Optional[int] = None
     ):
         super().__init__()
         if out_channels % cardinality != 0:
@@ -126,11 +201,25 @@ class ResNeXtBlock(nn.Module):
         else:
             self.shortcut = nn.Identity()
 
+        self.times_in = times_in
+        self.times_out = times_out
+        if times_in is not None:
+            self.temporal_fusion = TemporalFusion(out_channels, times_in, times_out)
+        else:
+            self.temporal_fusion = None
+
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.act(self.norm1(self.conv1(x)))
         out = self.act(self.norm2(self.conv2(out)))
         out = self.norm3(self.conv3(out))
-        return self.act(out + self.shortcut(x))
+
+        x = self.act(out + self.shortcut(x))
+
+        if self.temporal_fusion is not None:
+            x = self.temporal_fusion(x)
+
+        return x
 
 
 class ResNeXtUNet(nn.Module):
@@ -156,17 +245,19 @@ class ResNeXtUNet(nn.Module):
         self,
         geo_channels: int = N_SLOTS,
         mw_channels: int = N_MW_SLOTS,
-        base_channels: int = 32,
-        depth: int = 3,
+        base_channels: int = 48,
+        depth: int = 4,
         cardinality: int = 8,
         geo_downsample: int = RESOLUTION_RATIO,
         blocks_per_stage: Optional[Union[int, Sequence[int]]] = None,
+        times_in: Optional[int] = None
     ):
         super().__init__()
         self.geo_channels = geo_channels
         self.mw_channels = mw_channels
         self.base_channels = base_channels
         self.geo_downsample = geo_downsample
+        self.times_in = times_in
         out_channels = len(quantiles)
 
 
@@ -210,13 +301,25 @@ class ResNeXtUNet(nn.Module):
         # ``stage_blocks`` blocks at the (coarser) stage resolution.
         self.encoder = nn.ModuleList()
         skip_channels = [channels]
+
+        times_out = times_in
+
         for n_blocks in stage_blocks:
             self.encoder.append(
                 self._make_stage(
-                    channels, channels * 2, n_blocks, cardinality, stride=2
+                    channels,
+                    channels * 2,
+                    n_blocks,
+                    cardinality,
+                    stride=2,
+                    times_in=times_in,
+                    times_out=times_out
                 )
             )
             channels *= 2
+            if times_in is not None:
+                times_in = times_out
+                times_out = max(1, times_out // 2)
             skip_channels.append(channels)
 
         # Decoder: ``depth`` upsampling stages with skip connections, mirroring the
@@ -246,11 +349,26 @@ class ResNeXtUNet(nn.Module):
         n_blocks: int,
         cardinality: int,
         stride: int = 1,
+        times_in: Optional[int] = None,
+        times_out: Optional[int] = None
     ) -> nn.Sequential:
         """A (possibly strided) ResNeXt block followed by ``n_blocks - 1`` blocks."""
-        blocks = [ResNeXtBlock(in_channels, out_channels, cardinality, stride=stride)]
+        blocks = [ResNeXtBlock(
+            in_channels,
+            out_channels,
+            cardinality,
+            stride=stride,
+            times_in=times_in,
+            times_out=times_out
+        )]
         blocks += [
-            ResNeXtBlock(out_channels, out_channels, cardinality)
+            ResNeXtBlock(
+                out_channels,
+                out_channels,
+                cardinality,
+                times_in=times_out,
+                times_out=times_out
+            )
             for _ in range(n_blocks - 1)
         ]
         return nn.Sequential(*blocks)
@@ -259,18 +377,42 @@ class ResNeXtUNet(nn.Module):
         self,
         inpt: Dict[str, torch.Tensor]
     ) -> torch.Tensor:
+
+        times_in = self.times_in
+
+        has_time = False
+        x_geo = inpt["geo"]
+        if x_geo.ndim == 5:
+            T = x_geo.shape[2]
+            x_geo = x_geo.permute((0, 2, 1, 3, 4)).flatten(0, 1)
+            has_time = True
+
+        x_mw = inpt["mw"]
+        if x_mw.ndim == 5:
+            x_mw = x_mw.permute((0, 2, 1, 3, 4)).flatten(0, 1)
+
         geo = channel_dropout(
-            inpt["geo"],
+            x_geo,
+            0.1,
+            training=self.training
+        )
+        geo = batch_dropout(
+            geo,
             0.1,
             training=self.training
         )
         mw = channel_dropout(
-            inpt["mw"],
+            x_mw,
             0.1,
             training=self.training,
         )
-        mw_feat = self.mw_stem(torch.nan_to_num(mw))
-        geo_feat = self.geo_stem(torch.nan_to_num(geo))
+        mw = batch_dropout(
+            mw,
+            0.1,
+            training=self.training,
+        )
+        mw_feat = self.mw_stem(torch.nan_to_num(mw, nan=-1.5))
+        geo_feat = self.geo_stem(torch.nan_to_num(geo, nan=-1.5))
 
         # The output resolution follows the microwave/reference grid.
         reference = mw_feat if mw_feat is not None else geo_feat
@@ -294,10 +436,19 @@ class ResNeXtUNet(nn.Module):
         x = self.fuse(torch.cat([geo_feat, mw_feat], dim=1))
 
         # Encoder, keeping the skip connections.
-        skips: List[torch.Tensor] = [x]
+        if has_time:
+            skips: List[torch.Tensor] = [x[T - 1::T]]
+        else:
+            skips: List[torch.Tensor] = [x]
+
         for block in self.encoder:
             x = block(x)
-            skips.append(x)
+            skips.append(x if not has_time else x[T - 1::T])
+            if times_in is not None:
+                T = max(T // 2, 1)
+
+        if has_time:
+            x = x[T - 1::T]
 
         # Decoder with skip connections (the last skip is the bottleneck itself).
         for stage, (upsample, block) in enumerate(zip(self.upsamplers, self.decoder)):
