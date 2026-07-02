@@ -28,7 +28,14 @@ from torch.nn import functional as F
 
 from argos.data.dataset import N_MW_SLOTS, N_SLOTS, RESOLUTION_RATIO
 
-__all__ = ["ResNeXtBlock", "ResNeXtUNet"]
+__all__ = [
+    "ResNeXtBlock",
+    "ResNeXtUNet",
+    "SqueezeExcite",
+    "MBConv",
+    "FusedMBConv",
+    "EfficientNetV2UNet",
+]
 
 quantiles = [
     0.01,
@@ -151,10 +158,13 @@ class TemporalFusion(nn.Module):
         x = x.permute((0, 4, 2, 3, 1))
         x = self.channel_mlp(x)
 
-        # Order: B, T, H, W, C
+        # Order: B, T, C, H, W
         x = x.permute((0, 1, 4, 2, 3))
 
-        x = x + shortcut[:, :self.out_times]
+        # Residual from the most-recent ``out_times`` input frames: the current
+        # frame is the last one, and it is the frame selected downstream, so the
+        # residual must carry the recent frames rather than the oldest ones.
+        x = x + shortcut[:, -self.out_times:]
         return x.flatten(0, 1)
 
 
@@ -303,6 +313,7 @@ class ResNeXtUNet(nn.Module):
         skip_channels = [channels]
 
         times_out = times_in
+        stage_times_out = times_in  # #times after the most recent encoder stage
 
         for n_blocks in stage_blocks:
             self.encoder.append(
@@ -318,9 +329,23 @@ class ResNeXtUNet(nn.Module):
             )
             channels *= 2
             if times_in is not None:
+                stage_times_out = times_out
                 times_in = times_out
                 times_out = max(1, times_out // 2)
             skip_channels.append(channels)
+
+        # With temporal fusion the encoder must collapse the time dimension to a
+        # single frame by the bottleneck: the decoder and skip connections carry
+        # only the current (last) frame, so any leftover frames would break the
+        # skip-connection concatenation. This holds iff ``times_in`` reduces to 1
+        # over the ``depth`` stages, i.e. ``times_in <= 2**depth - 1``.
+        if self.times_in is not None and stage_times_out != 1:
+            raise ValueError(
+                f"times_in ({self.times_in}) is too large for depth ({depth}): "
+                f"the temporal dimension only reduces to {stage_times_out} frames "
+                f"at the bottleneck instead of 1. Use times_in <= "
+                f"{2 ** depth - 1} or increase depth."
+            )
 
         # Decoder: ``depth`` upsampling stages with skip connections, mirroring the
         # encoder so that each stage has the same number of blocks as the encoder
@@ -440,6 +465,439 @@ class ResNeXtUNet(nn.Module):
             skips: List[torch.Tensor] = [x[T - 1::T]]
         else:
             skips: List[torch.Tensor] = [x]
+
+        for block in self.encoder:
+            x = block(x)
+            skips.append(x if not has_time else x[T - 1::T])
+            if times_in is not None:
+                T = max(T // 2, 1)
+
+        if has_time:
+            x = x[T - 1::T]
+
+        # Decoder with skip connections (the last skip is the bottleneck itself).
+        for stage, (upsample, block) in enumerate(zip(self.upsamplers, self.decoder)):
+            skip = skips[-2 - stage]
+            x = F.interpolate(
+                x, size=skip.shape[-2:], mode="bilinear", align_corners=False
+            )
+            x = upsample(x)
+            x = block(torch.cat([x, skip], dim=1))
+
+        return {
+            "surface_precip": QuantileTensor(
+                self.head(x),
+                tau=self.quantiles.to(dtype=x.dtype, device=x.device)
+            )
+        }
+
+
+class SqueezeExcite(nn.Module):
+    """
+    Squeeze-and-excitation channel attention.
+
+    Global-average-pools the feature map to a channel descriptor, passes it
+    through a small bottleneck MLP (implemented as ``1x1`` convolutions) and uses
+    the resulting per-channel gates to rescale the input.
+    """
+
+    def __init__(self, channels: int, squeeze_channels: int):
+        super().__init__()
+        self.reduce = nn.Conv2d(channels, squeeze_channels, 1)
+        self.expand = nn.Conv2d(squeeze_channels, channels, 1)
+        self.act = nn.SiLU(inplace=True)
+        self.gate = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        s = x.mean(dim=(2, 3), keepdim=True)
+        s = self.act(self.reduce(s))
+        s = self.gate(self.expand(s))
+        return x * s
+
+
+class MBConv(nn.Module):
+    """
+    EfficientNet-V2 mobile inverted bottleneck (MBConv) block.
+
+    Performs ``1x1 expand -> 3x3 depthwise -> squeeze-excite -> 1x1 project``
+    with a residual connection when the shape is preserved. As with
+    :class:`ResNeXtBlock`, an optional :class:`TemporalFusion` acts on the time
+    dimension (folded into the batch) after the residual add.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 1,
+        expand_ratio: int = 4,
+        se_ratio: float = 0.25,
+        times_in: Optional[int] = None,
+        times_out: Optional[int] = None,
+    ):
+        super().__init__()
+        hidden = in_channels * expand_ratio
+        layers: List[nn.Module] = []
+        if expand_ratio != 1:
+            layers += [
+                nn.Conv2d(in_channels, hidden, 1, bias=False),
+                nn.BatchNorm2d(hidden),
+                nn.SiLU(inplace=True),
+            ]
+        layers += [
+            nn.Conv2d(
+                hidden, hidden, 3,
+                stride=stride, padding=1, groups=hidden, bias=False,
+            ),
+            nn.BatchNorm2d(hidden),
+            nn.SiLU(inplace=True),
+        ]
+        if se_ratio > 0:
+            layers.append(
+                SqueezeExcite(hidden, max(1, int(in_channels * se_ratio)))
+            )
+        layers += [
+            nn.Conv2d(hidden, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        ]
+        self.block = nn.Sequential(*layers)
+        self.use_residual = stride == 1 and in_channels == out_channels
+
+        self.times_in = times_in
+        self.times_out = times_out
+        if times_in is not None:
+            self.temporal_fusion = TemporalFusion(out_channels, times_in, times_out)
+        else:
+            self.temporal_fusion = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.block(x)
+        if self.use_residual:
+            out = out + x
+        if self.temporal_fusion is not None:
+            out = self.temporal_fusion(out)
+        return out
+
+
+class FusedMBConv(nn.Module):
+    """
+    EfficientNet-V2 Fused-MBConv block.
+
+    Fuses the expansion and spatial mixing into a single ``3x3`` convolution
+    (optionally followed by squeeze-excitation) and a ``1x1`` projection. Used in
+    the finer stages of EfficientNet-V2, where a fused convolution is faster than
+    a depthwise one. With ``expand_ratio == 1`` the projection is dropped and the
+    block is a single ``3x3`` convolution.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 1,
+        expand_ratio: int = 4,
+        se_ratio: float = 0.0,
+        times_in: Optional[int] = None,
+        times_out: Optional[int] = None,
+    ):
+        super().__init__()
+        hidden = in_channels * expand_ratio
+        layers: List[nn.Module] = []
+        if expand_ratio != 1:
+            layers += [
+                nn.Conv2d(
+                    in_channels, hidden, 3,
+                    stride=stride, padding=1, bias=False,
+                ),
+                nn.BatchNorm2d(hidden),
+                nn.SiLU(inplace=True),
+            ]
+            if se_ratio > 0:
+                layers.append(
+                    SqueezeExcite(hidden, max(1, int(in_channels * se_ratio)))
+                )
+            layers += [
+                nn.Conv2d(hidden, out_channels, 1, bias=False),
+                nn.BatchNorm2d(out_channels),
+            ]
+        else:
+            layers += [
+                nn.Conv2d(
+                    in_channels, out_channels, 3,
+                    stride=stride, padding=1, bias=False,
+                ),
+                nn.BatchNorm2d(out_channels),
+                nn.SiLU(inplace=True),
+            ]
+            if se_ratio > 0:
+                layers.append(
+                    SqueezeExcite(out_channels, max(1, int(in_channels * se_ratio)))
+                )
+        self.block = nn.Sequential(*layers)
+        self.use_residual = stride == 1 and in_channels == out_channels
+
+        self.times_in = times_in
+        self.times_out = times_out
+        if times_in is not None:
+            self.temporal_fusion = TemporalFusion(out_channels, times_in, times_out)
+        else:
+            self.temporal_fusion = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.block(x)
+        if self.use_residual:
+            out = out + x
+        if self.temporal_fusion is not None:
+            out = self.temporal_fusion(out)
+        return out
+
+
+class EfficientNetV2UNet(nn.Module):
+    """
+    An EfficientNet-V2 U-Net fusing geostationary and microwave observations.
+
+    A drop-in alternative to :class:`ResNeXtUNet` with the same inputs, output
+    and (optional) temporal-fusion behaviour, but built from EfficientNet-V2
+    Fused-MBConv/MBConv blocks with squeeze-excitation. The finer encoder stages
+    use :class:`FusedMBConv` and the coarser ones :class:`MBConv`, following
+    EfficientNet-V2.
+
+    Args:
+        geo_channels: Number of geostationary input channels.
+        mw_channels: Number of microwave input channels.
+        base_channels: Channel width of the first (full-resolution) stage.
+        depth: Number of down-/up-sampling stages of the U-Net.
+        expand_ratio: Inverted-bottleneck expansion ratio of the blocks.
+        se_ratio: Squeeze-excitation ratio of the MBConv blocks.
+        geo_downsample: Factor by which the geostationary input is downsampled to
+            reach the microwave/reference resolution.
+        blocks_per_stage: Number of blocks in each encoder stage. Either an
+            ``int`` (same for every stage) or a sequence of length ``depth`` (one
+            entry per stage, from finest to coarsest). Defaults to
+            ``(1, 2, ..., depth)``.
+        fused_stages: Number of leading (finer) encoder stages that use
+            :class:`FusedMBConv`; the remaining stages use :class:`MBConv`.
+            Defaults to ``depth // 2``.
+        times_in: If set, the number of input time steps; enables temporal
+            fusion. Must reduce to a single frame by the bottleneck, i.e.
+            ``times_in <= 2**depth - 1``.
+    """
+
+    def __init__(
+        self,
+        geo_channels: int = N_SLOTS,
+        mw_channels: int = N_MW_SLOTS,
+        base_channels: int = 48,
+        depth: int = 4,
+        expand_ratio: int = 4,
+        se_ratio: float = 0.25,
+        geo_downsample: int = RESOLUTION_RATIO,
+        blocks_per_stage: Optional[Union[int, Sequence[int]]] = None,
+        fused_stages: Optional[int] = None,
+        times_in: Optional[int] = None,
+    ):
+        super().__init__()
+        self.geo_channels = geo_channels
+        self.mw_channels = mw_channels
+        self.base_channels = base_channels
+        self.geo_downsample = geo_downsample
+        self.times_in = times_in
+        out_channels = len(quantiles)
+
+        # Number of blocks in each (increasingly coarse) encoder stage.
+        if blocks_per_stage is None:
+            stage_blocks = list(range(1, depth + 1))
+        elif isinstance(blocks_per_stage, int):
+            stage_blocks = [blocks_per_stage] * depth
+        else:
+            stage_blocks = list(blocks_per_stage)
+            if len(stage_blocks) != depth:
+                raise ValueError(
+                    f"blocks_per_stage must have length depth ({depth}), got "
+                    f"{len(stage_blocks)}."
+                )
+        self.blocks_per_stage = stage_blocks
+
+        if fused_stages is None:
+            fused_stages = depth // 2
+        self.fused_stages = fused_stages
+
+        channels = base_channels
+
+        # Input stems. The geo stem downsamples to the microwave resolution.
+        self.geo_stem = nn.Sequential(
+            nn.Conv2d(
+                geo_channels, channels, 3,
+                stride=geo_downsample, padding=1, bias=False,
+            ),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            FusedMBConv(channels, channels, expand_ratio=1),
+        )
+        self.mw_stem = nn.Sequential(
+            nn.Conv2d(mw_channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.SiLU(inplace=True),
+            FusedMBConv(channels, channels, expand_ratio=1),
+        )
+        # Fuse the two (concatenated) feature maps.
+        self.fuse = FusedMBConv(2 * channels, channels, expand_ratio=1)
+
+        # Encoder: ``depth`` downsampling stages, doubling the channels each time.
+        self.encoder = nn.ModuleList()
+        skip_channels = [channels]
+
+        times_out = times_in
+        stage_times_out = times_in  # #times after the most recent encoder stage
+
+        for stage, n_blocks in enumerate(stage_blocks):
+            block_cls = FusedMBConv if stage < fused_stages else MBConv
+            self.encoder.append(
+                self._make_stage(
+                    block_cls,
+                    channels,
+                    channels * 2,
+                    n_blocks,
+                    expand_ratio,
+                    se_ratio,
+                    stride=2,
+                    times_in=times_in,
+                    times_out=times_out,
+                )
+            )
+            channels *= 2
+            if times_in is not None:
+                stage_times_out = times_out
+                times_in = times_out
+                times_out = max(1, times_out // 2)
+            skip_channels.append(channels)
+
+        # The encoder must collapse the time dimension to a single frame by the
+        # bottleneck (see :class:`ResNeXtUNet`): the decoder and skip connections
+        # carry only the current (last) frame. This holds iff ``times_in`` reduces
+        # to 1 over the ``depth`` stages, i.e. ``times_in <= 2**depth - 1``.
+        if self.times_in is not None and stage_times_out != 1:
+            raise ValueError(
+                f"times_in ({self.times_in}) is too large for depth ({depth}): "
+                f"the temporal dimension only reduces to {stage_times_out} frames "
+                f"at the bottleneck instead of 1. Use times_in <= "
+                f"{2 ** depth - 1} or increase depth."
+            )
+
+        # Decoder: ``depth`` upsampling stages with skip connections, mirroring the
+        # encoder. Decoder stages always use MBConv and never fuse time (time has
+        # already collapsed to a single frame).
+        self.upsamplers = nn.ModuleList()
+        self.decoder = nn.ModuleList()
+        for stage, n_blocks in enumerate(reversed(stage_blocks)):
+            self.upsamplers.append(
+                nn.Conv2d(channels, channels // 2, 1, bias=False)
+            )
+            skip = skip_channels[depth - 1 - stage]
+            self.decoder.append(
+                self._make_stage(
+                    MBConv,
+                    channels // 2 + skip,
+                    channels // 2,
+                    n_blocks,
+                    expand_ratio,
+                    se_ratio,
+                )
+            )
+            channels //= 2
+
+        self.quantiles = torch.tensor(quantiles)
+        self.head = nn.Conv2d(channels, out_channels, 1)
+
+    @staticmethod
+    def _make_stage(
+        block_cls: type,
+        in_channels: int,
+        out_channels: int,
+        n_blocks: int,
+        expand_ratio: int,
+        se_ratio: float,
+        stride: int = 1,
+        times_in: Optional[int] = None,
+        times_out: Optional[int] = None,
+    ) -> nn.Sequential:
+        """A (possibly strided) block followed by ``n_blocks - 1`` blocks."""
+        blocks = [
+            block_cls(
+                in_channels,
+                out_channels,
+                stride=stride,
+                expand_ratio=expand_ratio,
+                se_ratio=se_ratio,
+                times_in=times_in,
+                times_out=times_out,
+            )
+        ]
+        blocks += [
+            block_cls(
+                out_channels,
+                out_channels,
+                expand_ratio=expand_ratio,
+                se_ratio=se_ratio,
+                times_in=times_out,
+                times_out=times_out,
+            )
+            for _ in range(n_blocks - 1)
+        ]
+        return nn.Sequential(*blocks)
+
+    def forward(
+        self,
+        inpt: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+
+        times_in = self.times_in
+
+        has_time = False
+        x_geo = inpt["geo"]
+        if x_geo.ndim == 5:
+            T = x_geo.shape[2]
+            x_geo = x_geo.permute((0, 2, 1, 3, 4)).flatten(0, 1)
+            has_time = True
+
+        x_mw = inpt["mw"]
+        if x_mw.ndim == 5:
+            x_mw = x_mw.permute((0, 2, 1, 3, 4)).flatten(0, 1)
+
+        geo = channel_dropout(x_geo, 0.1, training=self.training)
+        geo = batch_dropout(geo, 0.1, training=self.training)
+        mw = channel_dropout(x_mw, 0.1, training=self.training)
+        mw = batch_dropout(mw, 0.1, training=self.training)
+
+        mw_feat = self.mw_stem(torch.nan_to_num(mw, nan=-1.5))
+        geo_feat = self.geo_stem(torch.nan_to_num(geo, nan=-1.5))
+
+        # The output resolution follows the microwave/reference grid.
+        reference = mw_feat if mw_feat is not None else geo_feat
+        size = reference.shape[-2:]
+        batch, device, dtype = (
+            reference.shape[0], reference.device, reference.dtype,
+        )
+        if geo_feat is None:
+            geo_feat = torch.zeros(
+                batch, self.base_channels, *size, device=device, dtype=dtype
+            )
+        elif geo_feat.shape[-2:] != size:
+            geo_feat = F.interpolate(
+                geo_feat, size=size, mode="bilinear", align_corners=False
+            )
+        if mw_feat is None:
+            mw_feat = torch.zeros(
+                batch, self.base_channels, *size, device=device, dtype=dtype
+            )
+
+        x = self.fuse(torch.cat([geo_feat, mw_feat], dim=1))
+
+        # Encoder, keeping the skip connections (current frame only when temporal).
+        if has_time:
+            skips: List[torch.Tensor] = [x[T - 1::T]]
+        else:
+            skips = [x]
 
         for block in self.encoder:
             x = block(x)
