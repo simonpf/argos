@@ -1129,11 +1129,9 @@ class ArgosTrainingData(Dataset):
         sp_f[sp == fill] = np.nan
         return sp_f
 
-    def _normalize(self, array: np.ndarray, sensor: str) -> np.ndarray:
-        """Scale a sensor's ``(channel, ...)`` observations to ``[0, 1]``."""
-        stats = self.normalization_stats.get(sensor)
-        if stats is None:
-            return array
+    @staticmethod
+    def _scale_to_unit(array: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarray:
+        """Scale ``(channel, ...)`` observations to ``[-1, 1]`` using min/max stats."""
         lower = stats["min"][:, None, None]
         rng = stats["max"][:, None, None] - lower
         # Leave channels without valid statistics (e.g. never-observed) as is.
@@ -1141,6 +1139,13 @@ class ArgosTrainingData(Dataset):
         lower = np.where(valid, lower, 0.0)
         rng = np.where(valid, rng, 1.0)
         return -1.0 + 2.0 * ((array - lower) / rng).astype(np.float32)
+
+    def _normalize(self, array: np.ndarray, sensor: str) -> np.ndarray:
+        """Scale a sensor's ``(channel, ...)`` observations to ``[-1, 1]``."""
+        stats = self.normalization_stats.get(sensor)
+        if stats is None:
+            return array
+        return self._scale_to_unit(array, stats)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -1670,6 +1675,284 @@ class ArgosTrainingData(Dataset):
 
         LOGGER.info("Wrote %d temporal scenes to '%s'.", n_scenes, output_path)
         return output_path
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+    @cached_property
+    def _grid_latlon(self) -> Tuple[np.ndarray, np.ndarray]:
+        """The (latitude, longitude) arrays of the reference grid (from a store)."""
+        first = self.reference_files[self.reference_name][0]
+        store = zarr.open_group(str(first), mode="r")
+        return (
+            np.asarray(store["latitude"][:]).astype(np.float32),
+            np.asarray(store["longitude"][:]).astype(np.float32),
+        )
+
+    @staticmethod
+    def _coord_window(axis: np.ndarray, lo: float, hi: float) -> Tuple[int, int]:
+        """Half-open index range ``[start, end)`` of ``axis`` covering ``[lo, hi]``."""
+        within = np.where((axis >= lo) & (axis <= hi))[0]
+        if within.size == 0:
+            return 0, 0
+        return int(within.min()), int(within.max()) + 1
+
+    @staticmethod
+    def _tile_starts(begin: int, end: int, tile: int, stride: int, limit: int) -> List[int]:
+        """Tile start indices covering ``[begin, end)`` with windows inside ``limit``."""
+        if tile >= limit:
+            return [0]
+        starts = list(range(begin, end, stride)) or [begin]
+        if starts[-1] + tile < end:  # make sure the far edge is covered
+            starts.append(end - tile)
+        return sorted({min(max(s, 0), limit - tile) for s in starts})
+
+    @staticmethod
+    def _accumulate_tile(
+        acc, wgt, pred, window, tr0, tc0, tile, r_start, c_start, r_end, c_end
+    ) -> None:
+        """Blend a tile's prediction into the region accumulators via ``window``."""
+        rr0, rr1 = max(tr0, r_start), min(tr0 + tile, r_end)
+        cc0, cc1 = max(tc0, c_start), min(tc0 + tile, c_end)
+        if rr1 <= rr0 or cc1 <= cc0:
+            return
+        tile_rows, tile_cols = slice(rr0 - tr0, rr1 - tr0), slice(cc0 - tc0, cc1 - tc0)
+        acc_rows = slice(rr0 - r_start, rr1 - r_start)
+        acc_cols = slice(cc0 - c_start, cc1 - c_start)
+        p = pred[tile_rows, tile_cols]
+        w = window[tile_rows, tile_cols]
+        valid = np.isfinite(p)
+        acc[acc_rows, acc_cols] += np.where(valid, p * w, 0.0)
+        wgt[acc_rows, acc_cols] += np.where(valid, w, 0.0)
+
+    def infer(
+        self,
+        model: "torch.nn.Module",
+        target_time: Union[str, np.datetime64],
+        bounds: Tuple[float, float, float, float],
+        tile_size: Optional[int] = None,
+        overlap: int = 0,
+        n_steps: int = 1,
+        step: np.timedelta64 = np.timedelta64(20, "m"),
+        tolerance: Optional[np.timedelta64] = None,
+        device: Optional[Union[str, "torch.device"]] = None,
+    ) -> xr.Dataset:
+        """
+        Run tiled inference for a target time over a lon/lat bounding box.
+
+        The bounding box (on the reference 0.05-degree grid) is covered with
+        overlapping ``tile_size`` tiles, stepping by ``tile_size - overlap``. For
+        every tile the geostationary and microwave observations available around
+        ``target_time`` are loaded -- as a temporal stack of ``n_steps`` frames,
+        ``step`` apart and ending at ``target_time`` -- slotted exactly as for
+        training, and passed through ``model``. Per-tile point predictions (the
+        posterior mean of quantile outputs) are blended back together with a Hann
+        window and returned as a gridded field.
+
+        Args:
+            model: The trained model, taking the ``{"geo", "mw"}`` input dict.
+            target_time: The time to run the retrieval for (the last frame).
+            bounds: The bounding box as ``(lon_ll, lat_ll, lon_ur, lat_ur)`` --
+                the lower-left and upper-right longitude/latitude corners.
+            tile_size: Side length of the (square) reference tile in reference
+                pixels. Defaults to the dataset's ``tile_size``.
+            overlap: Overlap between neighbouring tiles in reference pixels.
+            n_steps: Number of time steps (frames) to load. The last frame is at
+                ``target_time`` and earlier frames are ``step`` apart before it;
+                ``n_steps == 1`` gives a single (non-temporal) input.
+            step: Time between frames (``numpy.timedelta64``; default 20 minutes).
+            tolerance: Maximum offset between an observation and a frame time for
+                it to fill the frame (default ``step / 2``).
+            device: Device to run the model on. Defaults to the model's device.
+
+        Returns:
+            An :class:`xarray.Dataset` with the retrieved ``surface_precip`` on the
+            reference grid, with ``latitude``/``longitude`` coordinates spanning
+            the bounding box and a scalar ``time`` coordinate.
+        """
+        tile = int(self.tile_size if tile_size is None else tile_size)
+        overlap = int(overlap)
+        n_steps = int(n_steps)
+        if not 0 <= overlap < tile:
+            raise ValueError("overlap must satisfy 0 <= overlap < tile_size.")
+        if n_steps < 1:
+            raise ValueError("n_steps must be >= 1.")
+        step = np.timedelta64(step)
+        tolerance = np.timedelta64(step / 2 if tolerance is None else tolerance)
+        target = np.datetime64(target_time, "ns")
+        temporal = n_steps > 1
+        # Frame times: ``n_steps`` slots ``step`` apart, ending at ``target``.
+        slot_times = [target - (n_steps - 1 - s) * step for s in range(n_steps)]
+
+        if device is None:
+            try:
+                device = next(model.parameters()).device
+            except StopIteration:
+                device = torch.device("cpu")
+        device = torch.device(device)
+        model = model.to(device).eval()
+
+        # Map the bounding box to a reference-grid window and tile it.
+        latitude, longitude = self._grid_latlon
+        lon_ll, lat_ll, lon_ur, lat_ur = bounds
+        r_start, r_end = self._coord_window(latitude, lat_ll, lat_ur)
+        c_start, c_end = self._coord_window(longitude, lon_ll, lon_ur)
+        if r_end <= r_start or c_end <= c_start:
+            raise ValueError("The bounding box does not intersect the reference grid.")
+        ref_rows, ref_cols = latitude.shape[0], longitude.shape[0]
+        obs_size = tile * RESOLUTION_RATIO
+        stride = tile - overlap
+        row_starts = self._tile_starts(r_start, r_end, tile, stride, ref_rows)
+        col_starts = self._tile_starts(c_start, c_end, tile, stride, ref_cols)
+
+        # Restrict the metadata to the stores relevant for the target time window,
+        # so the per-tile search stays cheap.
+        window_lo = min(slot_times) - tolerance
+        window_hi = max(slot_times) + tolerance
+        geo_pool = {}
+        for sensor, meta in self.geo_meta.items():
+            times = meta["time"].values
+            sel = (times >= window_lo) & (times <= window_hi)
+            if sel.any():
+                geo_pool[sensor] = (
+                    times[sel],
+                    meta["filename"].values[sel],
+                    meta["availability"].values.astype(bool)[sel],
+                )
+        mw_pool = {}
+        for sensor, meta in self.microwave_meta.items():
+            times = meta["time"].values
+            avail = meta["availability"].values.astype(bool)
+            in_win = avail & ~np.isnat(times) & (times >= window_lo) & (times <= window_hi)
+            sel = in_win.reshape(times.shape[0], -1).any(axis=1)
+            if sel.any():
+                mw_pool[sensor] = (times[sel], meta["filename"].values[sel], avail[sel])
+
+        # Normalization statistics, computed from the metadata indices so that
+        # inference does not need the (reference-granule) sample index.
+        norm_stats = self._compute_normalization_stats() if self.normalize else {}
+
+        # Hann blending window (with a floor so lone-tile edges keep full weight).
+        taper = np.hanning(tile + 2)[1:-1].astype(np.float64)
+        window = np.outer(taper, taper) + 1e-3
+
+        acc = np.zeros((r_end - r_start, c_end - c_start), dtype=np.float64)
+        wgt = np.zeros_like(acc)
+
+        for tr0 in tqdm(row_starts, desc="Inferring tiles", unit="row"):
+            for tc0 in col_starts:
+                geo_scene, mw_scene, has_valid = self._load_inference_tile(
+                    tr0, tc0, tile, obs_size, slot_times, tolerance,
+                    geo_pool, mw_pool, norm_stats,
+                )
+                if not has_valid:
+                    continue
+                if temporal:
+                    geo = torch.from_numpy(geo_scene[None])
+                    mw = torch.from_numpy(mw_scene[None])
+                else:
+                    geo = torch.from_numpy(geo_scene[:, 0][None])
+                    mw = torch.from_numpy(mw_scene[:, 0][None])
+                inpt = {"geo": geo.to(device), "mw": mw.to(device)}
+                with torch.no_grad():
+                    out = model(inpt)
+                sp = out["surface_precip"] if isinstance(out, dict) else out
+                if hasattr(sp, "expected_value"):
+                    sp = sp.expected_value()
+                pred = (
+                    torch.as_tensor(sp).detach().to("cpu", torch.float32).numpy()
+                ).reshape(tile, tile)
+                self._accumulate_tile(
+                    acc, wgt, pred, window, tr0, tc0, tile,
+                    r_start, c_start, r_end, c_end,
+                )
+
+        with np.errstate(invalid="ignore"):
+            result = np.where(wgt > 0, acc / wgt, np.nan).astype(np.float32)
+
+        return xr.Dataset(
+            {"surface_precip": (("latitude", "longitude"), result)},
+            coords={
+                "latitude": ("latitude", latitude[r_start:r_end]),
+                "longitude": ("longitude", longitude[c_start:c_end]),
+                "time": target,
+            },
+        )
+
+    def _load_inference_tile(
+        self, tr0, tc0, tile, obs_size, slot_times, tolerance,
+        geo_pool, mw_pool, norm_stats,
+    ):
+        """
+        Load the slotted geo/microwave frames for one inference tile.
+
+        Returns ``(geo_scene, mw_scene, has_valid)`` where ``geo_scene`` has shape
+        ``(N_SLOTS, n_steps, obs_size, obs_size)`` and ``mw_scene``
+        ``(N_MW_SLOTS, n_steps, tile, tile)`` (missing frames left ``NaN``), and
+        ``has_valid`` indicates whether any observation was loaded at all.
+        """
+        n_steps = len(slot_times)
+        obs_r0, obs_c0 = tr0 * RESOLUTION_RATIO, tc0 * RESOLUTION_RATIO
+        cr0, cr1 = tr0 // REF_CELL, (tr0 + tile - 1) // REF_CELL + 1
+        cc0, cc1 = tc0 // REF_CELL, (tc0 + tile - 1) // REF_CELL + 1
+
+        geo_scene = np.full((N_SLOTS, n_steps, obs_size, obs_size), np.nan, np.float32)
+        mw_scene = np.full((N_MW_SLOTS, n_steps, tile, tile), np.nan, np.float32)
+        has_valid = False
+
+        # Geo: the sensor best covering the tile, nearest store to each frame.
+        geo_sensor, best_cov = None, 0
+        for sensor, (_, files, avail) in geo_pool.items():
+            cov = avail[:, cr0:cr1, cc0:cc1].reshape(len(files), -1).sum(axis=1)
+            top = int(cov.max()) if cov.size else 0
+            if top > best_cov:
+                geo_sensor, best_cov = sensor, top
+        if geo_sensor is not None:
+            gtimes, gfiles, gavail = geo_pool[geo_sensor]
+            covers = gavail[:, cr0:cr1, cc0:cc1].reshape(len(gfiles), -1).any(axis=1)
+            for s, slot in enumerate(slot_times):
+                offsets = np.abs(gtimes - slot)
+                candidates = np.where(covers & (offsets <= tolerance))[0]
+                if candidates.size == 0:
+                    continue
+                k = int(candidates[np.argmin(offsets[candidates])])
+                array = self._load_obs(
+                    self._store_path(geo_sensor, gfiles[k]), obs_r0, obs_c0, obs_size
+                )
+                stats = norm_stats.get(geo_sensor)
+                if stats is not None:
+                    array = self._scale_to_unit(array, stats)
+                geo_scene[:, s] = slot_observations(array, geo_sensor)
+                has_valid = True
+
+        # Microwave: nearest observation from any sensor covering the tile.
+        mw_candidates = []  # (representative scan time, sensor, filename)
+        for sensor, (mtimes, mfiles, mavail) in mw_pool.items():
+            sub_avail = mavail[:, cr0:cr1, cc0:cc1]
+            sub_time = mtimes[:, cr0:cr1, cc0:cc1]
+            covered = sub_avail & ~np.isnat(sub_time)
+            for k in np.where(covered.reshape(len(mfiles), -1).any(axis=1))[0]:
+                times_k = np.sort(sub_time[k][covered[k]])
+                mw_candidates.append((times_k[times_k.size // 2], sensor, mfiles[k]))
+        for s, slot in enumerate(slot_times):
+            best = None  # (offset, sensor, filename)
+            for scan_time, sensor, filename in mw_candidates:
+                offset = abs(scan_time - slot)
+                if offset <= tolerance and (best is None or offset < best[0]):
+                    best = (offset, sensor, filename)
+            if best is None:
+                continue
+            _, sensor, filename = best
+            array = self._load_mw_obs(
+                self._store_path(sensor, filename), tr0, tc0, tile
+            )
+            stats = norm_stats.get(sensor)
+            if stats is not None:
+                array = self._scale_to_unit(array, stats)
+            mw_scene[:, s] = slot_observations(array, sensor)
+            has_valid = True
+
+        return geo_scene, mw_scene, has_valid
 
     # ------------------------------------------------------------------
     # Diagnostics
