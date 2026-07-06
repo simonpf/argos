@@ -687,7 +687,7 @@ class EfficientNetV2UNet(nn.Module):
         self,
         geo_channels: int = N_SLOTS,
         mw_channels: int = N_MW_SLOTS,
-        base_channels: int = 48,
+        base_channels: int = 32,
         depth: int = 4,
         expand_ratio: int = 4,
         se_ratio: float = 0.25,

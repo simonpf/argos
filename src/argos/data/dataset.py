@@ -492,7 +492,7 @@ class ArgosTrainingData(Dataset):
         reference_name: str = DEFAULT_REFERENCE,
         tile_size: int = 128,
         time_window: np.timedelta64 = np.timedelta64(10, "m"),
-        position_jitter: int = REF_CELL // 2,
+        position_jitter: int = REF_CELL,
         slot_channels: bool = True,
         normalize: bool = True,
         require_both_inputs: bool = False,
