@@ -126,6 +126,8 @@ def evaluate_model(
     batch_size: int = 8,
     device: Optional[Union[str, torch.device]] = None,
     target_key: str = "surface_precip",
+    geo_only: bool = False,
+    mw_sensors: Optional[List[int]] = None,
 ) -> xr.Dataset:
     """
     Evaluate a trained model against the scenes of an :class:`ArgosDataset`.
@@ -146,6 +148,12 @@ def evaluate_model(
         batch_size: Number of scenes to run through the model at once.
         device: Device to run the model on. Defaults to the model's own device.
         target_key: Key of the target/prediction variable.
+        geo_only: If ``True``, set all microwave observations to ``NaN`` so the
+            model is evaluated on the geostationary input alone. The conditioned
+            breakdowns are then empty (no microwave observations are available).
+        mw_sensors: Optional list of sensor indices to keep. Microwave
+            observations from any other sensor are set to ``NaN``. Mutually
+            exclusive with ``geo_only``.
 
     Returns:
         An :class:`xarray.Dataset` with the overall metrics (``mae``, ``mse``,
@@ -154,6 +162,14 @@ def evaluate_model(
         a 2-D grid with a ``step`` dimension and a ``sensor`` dimension of sensor
         names.
     """
+    if geo_only and mw_sensors is not None:
+        raise ValueError("Pass at most one of 'geo_only' and 'mw_sensors'.")
+    allowed_sensors = (
+        None
+        if mw_sensors is None
+        else np.array(sorted({int(s) for s in mw_sensors}), dtype=np.int64)
+    )
+
     if device is None:
         try:
             device = next(model.parameters()).device
@@ -180,9 +196,20 @@ def evaluate_model(
     for start in range(0, n_scenes, batch_size):
         stop = min(start + batch_size, n_scenes)
         geo = np.asarray(store["geo"][start:stop])
-        mw = np.asarray(store["mw"][start:stop])
+        mw = np.array(store["mw"][start:stop])  # writable: nulled in place below
         target_np = np.asarray(store[target_key][start:stop])
         mw_sensor = np.asarray(store["mw_sensor"][start:stop])
+
+        # Optionally drop microwave observations before they reach the model and
+        # the conditioning fields (both derived from ``mw`` below).
+        if geo_only:
+            mw[:] = np.nan
+        elif allowed_sensors is not None:
+            drop = ~np.isin(mw_sensor, allowed_sensors)  # (b,) or (b, step)
+            if temporal:
+                mw[np.broadcast_to(drop[:, None, :, None, None], mw.shape)] = np.nan
+            else:
+                mw[drop] = np.nan
 
         inpt = {
             "geo": torch.from_numpy(geo).to(device),
