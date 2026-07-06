@@ -36,6 +36,7 @@ suitable, temporally-matched samples can be enumerated without touching the
 """
 from functools import cached_property
 import hashlib
+import html
 import logging
 from pathlib import Path
 import re
@@ -1953,6 +1954,132 @@ class ArgosTrainingData(Dataset):
             has_valid = True
 
         return geo_scene, mw_scene, has_valid
+
+    # ------------------------------------------------------------------
+    # Slot assignment tables
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _slot_table_html(caption, slot_columns, sensors, channel_cells) -> str:
+        """
+        Render a slot-assignment table as an HTML string.
+
+        Args:
+            caption: The table caption.
+            slot_columns: A list of ``(header, values)`` pairs describing the
+                per-slot leading columns (e.g. slot index, band name), where
+                ``values`` has one entry per slot.
+            sensors: The sensor names forming the remaining columns.
+            channel_cells: A ``{sensor: [cell, ...]}`` mapping giving, for each
+                slot, the HTML cell content of the channel(s) mapped to it (empty
+                where the sensor has no channel in that slot).
+        """
+        n_slots = len(slot_columns[0][1])
+        style = (
+            "border-collapse:collapse;font-family:sans-serif;font-size:13px;"
+            "text-align:center"
+        )
+        cell = "border:1px solid #ccc;padding:4px 8px"
+        head = f"{cell};background:#f0f0f0"
+
+        parts = [f'<table style="{style}">']
+        parts.append(f"<caption style='padding:6px;font-weight:bold'>{html.escape(caption)}</caption>")
+        headers = [h for h, _ in slot_columns] + list(sensors)
+        parts.append("<tr>" + "".join(
+            f'<th style="{head}">{html.escape(str(h))}</th>' for h in headers
+        ) + "</tr>")
+
+        for slot in range(n_slots):
+            row = [
+                f'<td style="{head}">{values[slot]}</td>' for _, values in slot_columns
+            ]
+            for sensor in sensors:
+                content = channel_cells[sensor][slot]
+                bg = "" if content else ";background:#fafafa;color:#bbb"
+                row.append(f'<td style="{cell}{bg}">{content or "&mdash;"}</td>')
+            parts.append("<tr>" + "".join(row) + "</tr>")
+        parts.append("</table>")
+        return "".join(parts)
+
+    def geo_slot_table_html(self) -> str:
+        """
+        Render the geostationary channel-to-slot assignment as an HTML table.
+
+        Rows are the :data:`N_SLOTS` spectral slots (with the slot's band name and
+        canonical wavelength) and columns are the dataset's input sensors; each
+        cell shows the sensor channel mapped to that slot (its stored index and
+        central wavelength), or a dash where the sensor has no such channel.
+
+        Returns:
+            The table as an HTML string (renders in a Jupyter notebook).
+        """
+        sensors = [s for s in self.input_sensors if s in CHANNEL_SLOTS]
+        cells = {sensor: ["" for _ in range(N_SLOTS)] for sensor in sensors}
+        for sensor in sensors:
+            wavelengths = SENSOR_WAVELENGTHS[sensor]
+            for channel, slot in enumerate(CHANNEL_SLOTS[sensor]):
+                if slot < 0:
+                    continue
+                entry = f"ch {channel} ({wavelengths[channel]:g} &micro;m)"
+                cells[sensor][slot] = (
+                    f"{cells[sensor][slot]}<br>{entry}"
+                    if cells[sensor][slot]
+                    else entry
+                )
+        slot_columns = [
+            ("Slot", [str(s) for s in range(N_SLOTS)]),
+            ("Band", [html.escape(name) for name in SLOT_NAMES]),
+            (
+                "&lambda; (&micro;m)",
+                [
+                    f"{wl:g}" if np.isfinite(wl) else "&mdash;"
+                    for wl in SLOT_WAVELENGTHS
+                ],
+            ),
+        ]
+        return self._slot_table_html(
+            "Geostationary channel slots", slot_columns, sensors, cells
+        )
+
+    def mw_slot_table_html(self) -> str:
+        """
+        Render the microwave channel-to-slot assignment as an HTML table.
+
+        Rows are the :data:`N_MW_SLOTS` frequency slots (with the slot's band
+        name, frequency and polarization) and columns are the dataset's microwave
+        sensors; each cell shows the sensor channel mapped to that slot (its
+        stored index and, where available, frequency/polarization), or a dash.
+
+        Returns:
+            The table as an HTML string (renders in a Jupyter notebook).
+        """
+        sensors = [s for s in self.microwave_sensors if s in MW_CHANNEL_SLOTS]
+        cells = {sensor: ["" for _ in range(N_MW_SLOTS)] for sensor in sensors}
+        for sensor in sensors:
+            specs = MW_SENSOR_CHANNELS[sensor]
+            for channel, slot in enumerate(MW_CHANNEL_SLOTS[sensor]):
+                if slot < 0:
+                    continue
+                spec = specs[channel]
+                if isinstance(spec, tuple):
+                    freq, offset, pol = spec
+                    label = f"{freq:g}&plusmn;{offset:g}" if offset else f"{freq:g}"
+                    entry = f"ch {channel} ({label} GHz {html.escape(pol)})"
+                else:
+                    entry = f"ch {channel}"
+                cells[sensor][slot] = (
+                    f"{cells[sensor][slot]}<br>{entry}"
+                    if cells[sensor][slot]
+                    else entry
+                )
+        slot_columns = [
+            ("Slot", [str(s) for s in range(N_MW_SLOTS)]),
+            ("Band", [html.escape(name) for name in MW_SLOT_NAMES]),
+            ("Freq (GHz)", [f"{freq:g}" for freq, _, _ in MW_SLOTS]),
+            ("Pol", [html.escape(pol) for _, _, pol in MW_SLOTS]),
+        ]
+        return self._slot_table_html(
+            "Microwave channel slots", slot_columns, sensors, cells
+        )
 
     # ------------------------------------------------------------------
     # Diagnostics
