@@ -203,6 +203,7 @@ def evaluate_model(
         stop = min(start + batch_size, n_scenes)
         geo = np.asarray(store["geo"][start:stop])
         mw = np.array(store["mw"][start:stop])  # writable: nulled in place below
+        mw_orig = mw.copy()
         target_np = np.asarray(store[target_key][start:stop])
         mw_sensor = np.asarray(store["mw_sensor"][start:stop])
 
@@ -234,7 +235,7 @@ def evaluate_model(
         sensor_coords = np.empty(target_np.shape, dtype=np.float32)
         for b in range(stop - start):
             step_field, sensor_field = _mw_fields(
-                mw[b], mw_sensor[b], temporal, frames
+                mw_orig[b], mw_sensor[b], temporal, frames
             )
             step_coords[b] = step_field
             sensor_coords[b] = sensor_field
