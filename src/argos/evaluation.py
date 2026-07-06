@@ -31,6 +31,7 @@ from typing import Dict, List, Optional, Union
 import numpy as np
 import torch
 import xarray as xr
+from tqdm import tqdm
 
 from pytorch_retrieve.metrics import MAE, MSE, CorrelationCoef, RelativeBias
 from pytorch_retrieve.tensors import MaskedTensor
@@ -193,7 +194,12 @@ def evaluate_model(
         _make_metrics({"step": frames, "sensor": n_sensors}) if n_sensors else None
     )
 
-    for start in range(0, n_scenes, batch_size):
+    for start in tqdm(
+        range(0, n_scenes, batch_size),
+        desc="Evaluating scenes",
+        unit="batch",
+        total=(n_scenes + batch_size - 1) // batch_size,
+    ):
         stop = min(start + batch_size, n_scenes)
         geo = np.asarray(store["geo"][start:stop])
         mw = np.array(store["mw"][start:stop])  # writable: nulled in place below
