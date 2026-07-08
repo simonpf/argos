@@ -1736,6 +1736,7 @@ class ArgosTrainingData(Dataset):
         n_steps: int = 1,
         step: np.timedelta64 = np.timedelta64(20, "m"),
         tolerance: Optional[np.timedelta64] = None,
+        geo_only: bool = False,
         device: Optional[Union[str, "torch.device"]] = None,
     ) -> xr.Dataset:
         """
@@ -1764,6 +1765,10 @@ class ArgosTrainingData(Dataset):
             step: Time between frames (``numpy.timedelta64``; default 20 minutes).
             tolerance: Maximum offset between an observation and a frame time for
                 it to fill the frame (default ``step / 2``).
+            geo_only: If ``True``, run the retrieval on the geostationary
+                observations alone: no microwave observations are loaded and the
+                ``mw`` input stays all-``NaN`` (which the model treats as
+                missing).
             device: Device to run the model on. Defaults to the model's device.
 
         Returns:
@@ -1820,14 +1825,24 @@ class ArgosTrainingData(Dataset):
                     meta["filename"].values[sel],
                     meta["availability"].values.astype(bool)[sel],
                 )
+        # With ``geo_only`` the microwave pool stays empty, so no microwave
+        # observations are loaded and the ``mw`` input remains all-NaN.
         mw_pool = {}
-        for sensor, meta in self.microwave_meta.items():
-            times = meta["time"].values
-            avail = meta["availability"].values.astype(bool)
-            in_win = avail & ~np.isnat(times) & (times >= window_lo) & (times <= window_hi)
-            sel = in_win.reshape(times.shape[0], -1).any(axis=1)
-            if sel.any():
-                mw_pool[sensor] = (times[sel], meta["filename"].values[sel], avail[sel])
+        if not geo_only:
+            for sensor, meta in self.microwave_meta.items():
+                times = meta["time"].values
+                avail = meta["availability"].values.astype(bool)
+                in_win = (
+                    avail
+                    & ~np.isnat(times)
+                    & (times >= window_lo)
+                    & (times <= window_hi)
+                )
+                sel = in_win.reshape(times.shape[0], -1).any(axis=1)
+                if sel.any():
+                    mw_pool[sensor] = (
+                        times[sel], meta["filename"].values[sel], avail[sel]
+                    )
 
         # Normalization statistics, computed from the metadata indices so that
         # inference does not need the (reference-granule) sample index.
