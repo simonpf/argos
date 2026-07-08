@@ -6,16 +6,16 @@ Plotting utilities for argos surface-precipitation retrievals.
 
 :func:`animate_results` renders one or more retrieval datasets (each holding a
 ``surface_precip`` field with a ``time`` coordinate) as a time animation on a
-cartopy map with coastlines. The datasets need not share the same time steps:
-every dataset is interpolated in time onto a common animation axis, so they
-advance together.
+cartopy map with coastlines; :func:`plot_frame` renders a single frame at a
+specific time. The datasets need not share the same time steps: every dataset is
+interpolated in time onto the requested time(s), so they advance together.
 """
 from typing import List, Optional, Sequence, Union
 
 import numpy as np
 import xarray as xr
 
-__all__ = ["animate_results"]
+__all__ = ["animate_results", "plot_frame"]
 
 
 def _dataset_times(ds: xr.Dataset) -> Optional[np.ndarray]:
@@ -61,6 +61,130 @@ def _interp_to_times(ds: xr.Dataset, times: np.ndarray) -> xr.DataArray:
     if da.sizes["time"] == 1:
         return da.reindex(time=times, method="nearest")
     return da.interp(time=times)
+
+
+def _draw_panels(
+    datasets: Sequence[xr.Dataset],
+    fields: Sequence[xr.DataArray],
+    frame: int,
+    titles: Optional[Sequence[str]],
+    vmin: float,
+    vmax: float,
+    cmap: str,
+    norm,
+    figsize: Optional[tuple],
+    coastline_resolution: str,
+):
+    """
+    Draw one cartopy panel (with coastlines) per dataset for a given frame.
+
+    Returns ``(fig, axes, meshes)``, with the colorbar already attached.
+    """
+    import cartopy.crs as ccrs
+    import matplotlib.pyplot as plt
+    from matplotlib import colors
+
+    n = len(datasets)
+    if norm is None:
+        norm = colors.LogNorm(vmin=vmin, vmax=vmax)
+    cmap_obj = plt.get_cmap(cmap).copy()
+    cmap_obj.set_bad("0.9")  # grey for missing/zero precipitation
+
+    if figsize is None:
+        figsize = (4.5 * n, 4.5)
+    # Data are on a regular lon/lat grid, so use a plate-carrée map projection.
+    data_crs = ccrs.PlateCarree()
+    fig, axes = plt.subplots(
+        1, n, figsize=figsize, squeeze=False,
+        subplot_kw={"projection": data_crs},
+    )
+    axes = axes.ravel()
+
+    meshes = []
+    for i, (ax, ds, da) in enumerate(zip(axes, datasets, fields)):
+        lon = np.asarray(ds["longitude"].values)
+        lat = np.asarray(ds["latitude"].values)
+        first = np.ma.masked_invalid(da.isel(time=frame).values)
+        mesh = ax.pcolormesh(
+            lon, lat, first, norm=norm, cmap=cmap_obj, shading="nearest",
+            transform=data_crs,
+        )
+        ax.coastlines(resolution=coastline_resolution, linewidth=0.8)
+        ax.set_extent(
+            [lon.min(), lon.max(), lat.min(), lat.max()], crs=data_crs
+        )
+        gridlines = ax.gridlines(
+            draw_labels=True, linewidth=0.4, color="0.6", alpha=0.5
+        )
+        gridlines.top_labels = False
+        gridlines.right_labels = False
+        ax.set_title(titles[i] if titles is not None else f"Dataset {i + 1}")
+        meshes.append(mesh)
+
+    fig.colorbar(
+        meshes[-1], ax=list(axes), shrink=0.85,
+        label=r"Surface precip. (mm h$^{-1}$)",
+    )
+    return fig, axes, meshes
+
+
+def plot_frame(
+    datasets: Union[xr.Dataset, Sequence[xr.Dataset]],
+    time: Union[str, np.datetime64],
+    titles: Optional[Sequence[str]] = None,
+    vmin: float = 0.1,
+    vmax: float = 50.0,
+    cmap: str = "turbo",
+    norm=None,
+    figsize: Optional[tuple] = None,
+    coastline_resolution: str = "50m",
+    save_path: Optional[str] = None,
+):
+    """
+    Plot the surface-precipitation retrievals of a single time as a static map.
+
+    Each dataset is drawn in its own panel on a cartopy map with coastlines,
+    exactly as one frame of :func:`animate_results`: datasets whose time steps do
+    not include ``time`` are linearly interpolated onto it (a time outside a
+    dataset's own range yields an empty panel).
+
+    Args:
+        datasets: A dataset or list of datasets, each with a ``surface_precip``
+            field (dimensions ``(time, latitude, longitude)``, or
+            ``(latitude, longitude)`` for a constant field) and
+            ``latitude``/``longitude`` coordinates.
+        time: The time to plot (anything ``numpy.datetime64`` accepts).
+        titles: Optional per-panel titles.
+        vmin: Lower bound of the (logarithmic) color scale, in mm/h.
+        vmax: Upper bound of the color scale, in mm/h.
+        cmap: Name of the colormap.
+        norm: Optional explicit :class:`matplotlib.colors.Normalize`. Defaults to
+            a :class:`~matplotlib.colors.LogNorm` over ``[vmin, vmax]``.
+        figsize: Figure size; defaults to ``(4.5 * n_panels, 4.5)``.
+        coastline_resolution: Resolution of the cartopy coastlines
+            (``"110m"``, ``"50m"`` or ``"10m"``).
+        save_path: If given, save the figure to this path.
+
+    Returns:
+        The :class:`matplotlib.figure.Figure` instance.
+    """
+    if isinstance(datasets, xr.Dataset):
+        datasets = [datasets]
+    datasets = list(datasets)
+    if not datasets:
+        raise ValueError("Provide at least one dataset.")
+
+    when = np.atleast_1d(np.datetime64(time, "ns"))
+    fields = [_interp_to_times(ds, when) for ds in datasets]
+
+    fig, _, _ = _draw_panels(
+        datasets, fields, 0, titles, vmin, vmax, cmap, norm,
+        figsize, coastline_resolution,
+    )
+    fig.suptitle(np.datetime_as_string(when[0], unit="m"))
+    if save_path is not None:
+        fig.savefig(save_path, bbox_inches="tight")
+    return fig
 
 
 def animate_results(
@@ -112,9 +236,7 @@ def animate_results(
     Returns:
         The :class:`matplotlib.animation.FuncAnimation` instance.
     """
-    import cartopy.crs as ccrs
-    import matplotlib.pyplot as plt
-    from matplotlib import animation, colors
+    from matplotlib import animation
 
     if isinstance(datasets, xr.Dataset):
         datasets = [datasets]
@@ -125,46 +247,9 @@ def animate_results(
     frame_times = _common_times(datasets, times, n_frames)
     fields = [_interp_to_times(ds, frame_times) for ds in datasets]
 
-    n = len(datasets)
-    if norm is None:
-        norm = colors.LogNorm(vmin=vmin, vmax=vmax)
-    cmap_obj = plt.get_cmap(cmap).copy()
-    cmap_obj.set_bad("0.9")  # grey for missing/zero precipitation
-
-    if figsize is None:
-        figsize = (4.5 * n, 4.5)
-    # Data are on a regular lon/lat grid, so use a plate-carrée map projection.
-    data_crs = ccrs.PlateCarree()
-    fig, axes = plt.subplots(
-        1, n, figsize=figsize, squeeze=False,
-        subplot_kw={"projection": data_crs},
-    )
-    axes = axes.ravel()
-
-    meshes = []
-    for i, (ax, ds, da) in enumerate(zip(axes, datasets, fields)):
-        lon = np.asarray(ds["longitude"].values)
-        lat = np.asarray(ds["latitude"].values)
-        first = np.ma.masked_invalid(da.isel(time=0).values)
-        mesh = ax.pcolormesh(
-            lon, lat, first, norm=norm, cmap=cmap_obj, shading="nearest",
-            transform=data_crs,
-        )
-        ax.coastlines(resolution=coastline_resolution, linewidth=0.8)
-        ax.set_extent(
-            [lon.min(), lon.max(), lat.min(), lat.max()], crs=data_crs
-        )
-        gridlines = ax.gridlines(
-            draw_labels=True, linewidth=0.4, color="0.6", alpha=0.5
-        )
-        gridlines.top_labels = False
-        gridlines.right_labels = False
-        ax.set_title(titles[i] if titles is not None else f"Dataset {i + 1}")
-        meshes.append(mesh)
-
-    fig.colorbar(
-        meshes[-1], ax=list(axes), shrink=0.85,
-        label=r"Surface precip. (mm h$^{-1}$)",
+    fig, _, meshes = _draw_panels(
+        datasets, fields, 0, titles, vmin, vmax, cmap, norm,
+        figsize, coastline_resolution,
     )
     suptitle = fig.suptitle(np.datetime_as_string(frame_times[0], unit="m"))
 
