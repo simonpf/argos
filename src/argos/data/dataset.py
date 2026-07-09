@@ -1726,6 +1726,32 @@ class ArgosTrainingData(Dataset):
         acc[acc_rows, acc_cols] += np.where(valid, p * w, 0.0)
         wgt[acc_rows, acc_cols] += np.where(valid, w, 0.0)
 
+    @staticmethod
+    def _merge_aux_tile(
+        age_acc, sensor_acc, tile_age, tile_sensor,
+        tr0, tc0, tile, r_start, c_start, r_end, c_end,
+    ) -> None:
+        """
+        Merge a tile's per-pixel age/sensor fields into the region accumulators.
+
+        Unlike the (continuous) prediction, these fields are categorical, so
+        overlapping tiles are resolved by keeping the most recent observation
+        (smallest age) per pixel rather than by blending.
+        """
+        rr0, rr1 = max(tr0, r_start), min(tr0 + tile, r_end)
+        cc0, cc1 = max(tc0, c_start), min(tc0 + tile, c_end)
+        if rr1 <= rr0 or cc1 <= cc0:
+            return
+        tile_rows, tile_cols = slice(rr0 - tr0, rr1 - tr0), slice(cc0 - tc0, cc1 - tc0)
+        acc_rows = slice(rr0 - r_start, rr1 - r_start)
+        acc_cols = slice(cc0 - c_start, cc1 - c_start)
+        sub_age = tile_age[tile_rows, tile_cols]
+        sub_sensor = tile_sensor[tile_rows, tile_cols]
+        current = age_acc[acc_rows, acc_cols]
+        better = np.isfinite(sub_age) & (~np.isfinite(current) | (sub_age < current))
+        age_acc[acc_rows, acc_cols][better] = sub_age[better]
+        sensor_acc[acc_rows, acc_cols][better] = sub_sensor[better]
+
     def infer(
         self,
         model: "torch.nn.Module",
@@ -1774,7 +1800,14 @@ class ArgosTrainingData(Dataset):
         Returns:
             An :class:`xarray.Dataset` with the retrieved ``surface_precip`` on the
             reference grid, with ``latitude``/``longitude`` coordinates spanning
-            the bounding box and a scalar ``time`` coordinate.
+            the bounding box and a scalar ``time`` coordinate. Two auxiliary
+            per-pixel fields describe the microwave input: ``mw_age``, the age (in
+            minutes before ``target_time``, based on the frame times) of the most
+            recent microwave observation covering the pixel (``NaN`` where none),
+            and ``mw_sensor``, the index into ``microwave_sensors`` (listed in the
+            variable's ``sensors`` attribute) of the sensor that provided it
+            (``-1`` where none). Where tiles overlap, the most recent observation
+            wins.
         """
         tile = int(self.tile_size if tile_size is None else tile_size)
         overlap = int(overlap)
@@ -1854,15 +1887,39 @@ class ArgosTrainingData(Dataset):
 
         acc = np.zeros((r_end - r_start, c_end - c_start), dtype=np.float64)
         wgt = np.zeros_like(acc)
+        # Auxiliary per-pixel fields: age (minutes before ``target_time``) and
+        # sensor index of the most recent microwave observation covering a pixel.
+        step_minutes = float(step / np.timedelta64(1, "m"))
+        sensor_index = {s: i for i, s in enumerate(self.microwave_sensors)}
+        age_acc = np.full(acc.shape, np.nan, dtype=np.float32)
+        sensor_acc = np.full(acc.shape, -1, dtype=np.int16)
 
         for tr0 in tqdm(row_starts, desc="Inferring tiles", unit="row"):
             for tc0 in col_starts:
-                geo_scene, mw_scene, has_valid = self._load_inference_tile(
-                    tr0, tc0, tile, obs_size, slot_times, tolerance,
-                    geo_pool, mw_pool, norm_stats,
+                geo_scene, mw_scene, mw_frame_sensors, has_valid = (
+                    self._load_inference_tile(
+                        tr0, tc0, tile, obs_size, slot_times, tolerance,
+                        geo_pool, mw_pool, norm_stats,
+                    )
                 )
                 if not has_valid:
                     continue
+
+                # Per-pixel microwave age/sensor fields for this tile. Iterating
+                # frames oldest-to-newest makes the most recent observation win.
+                tile_age = np.full((tile, tile), np.nan, dtype=np.float32)
+                tile_sensor = np.full((tile, tile), -1, dtype=np.int16)
+                covered = np.isfinite(mw_scene).any(axis=0)  # (n_steps, tile, tile)
+                for s in range(n_steps):
+                    if mw_frame_sensors[s] is None:
+                        continue
+                    here = covered[s]
+                    tile_age[here] = (n_steps - 1 - s) * step_minutes
+                    tile_sensor[here] = sensor_index[mw_frame_sensors[s]]
+                self._merge_aux_tile(
+                    age_acc, sensor_acc, tile_age, tile_sensor,
+                    tr0, tc0, tile, r_start, c_start, r_end, c_end,
+                )
                 if temporal:
                     geo = torch.from_numpy(geo_scene[None])
                     mw = torch.from_numpy(mw_scene[None])
@@ -1886,14 +1943,28 @@ class ArgosTrainingData(Dataset):
         with np.errstate(invalid="ignore"):
             result = np.where(wgt > 0, acc / wgt, np.nan).astype(np.float32)
 
-        return xr.Dataset(
-            {"surface_precip": (("latitude", "longitude"), result)},
+        results = xr.Dataset(
+            {
+                "surface_precip": (("latitude", "longitude"), result),
+                "mw_age": (("latitude", "longitude"), age_acc),
+                "mw_sensor": (("latitude", "longitude"), sensor_acc),
+            },
             coords={
                 "latitude": ("latitude", latitude[r_start:r_end]),
                 "longitude": ("longitude", longitude[c_start:c_end]),
                 "time": target,
             },
         )
+        results.mw_age.attrs.update(
+            full_name="Age of the most recent microwave observation",
+            unit="minutes before target time",
+        )
+        results.mw_sensor.attrs.update(
+            full_name="Sensor of the most recent microwave observation",
+            sensors=list(self.microwave_sensors),
+            fill_value=-1,
+        )
+        return results
 
     def _load_inference_tile(
         self, tr0, tc0, tile, obs_size, slot_times, tolerance,
@@ -1902,10 +1973,12 @@ class ArgosTrainingData(Dataset):
         """
         Load the slotted geo/microwave frames for one inference tile.
 
-        Returns ``(geo_scene, mw_scene, has_valid)`` where ``geo_scene`` has shape
-        ``(N_SLOTS, n_steps, obs_size, obs_size)`` and ``mw_scene``
-        ``(N_MW_SLOTS, n_steps, tile, tile)`` (missing frames left ``NaN``), and
-        ``has_valid`` indicates whether any observation was loaded at all.
+        Returns ``(geo_scene, mw_scene, mw_frame_sensors, has_valid)`` where
+        ``geo_scene`` has shape ``(N_SLOTS, n_steps, obs_size, obs_size)`` and
+        ``mw_scene`` ``(N_MW_SLOTS, n_steps, tile, tile)`` (missing frames left
+        ``NaN``), ``mw_frame_sensors`` names the microwave sensor filling each
+        frame (``None`` for empty frames), and ``has_valid`` indicates whether
+        any observation was loaded at all.
         """
         n_steps = len(slot_times)
         obs_r0, obs_c0 = tr0 * RESOLUTION_RATIO, tc0 * RESOLUTION_RATIO
@@ -1914,6 +1987,7 @@ class ArgosTrainingData(Dataset):
 
         geo_scene = np.full((N_SLOTS, n_steps, obs_size, obs_size), np.nan, np.float32)
         mw_scene = np.full((N_MW_SLOTS, n_steps, tile, tile), np.nan, np.float32)
+        mw_frame_sensors: List[Optional[str]] = [None] * n_steps
         has_valid = False
 
         # Geo: the sensor best covering the tile, nearest store to each frame.
@@ -1966,9 +2040,10 @@ class ArgosTrainingData(Dataset):
             if stats is not None:
                 array = self._scale_to_unit(array, stats)
             mw_scene[:, s] = slot_observations(array, sensor)
+            mw_frame_sensors[s] = sensor
             has_valid = True
 
-        return geo_scene, mw_scene, has_valid
+        return geo_scene, mw_scene, mw_frame_sensors, has_valid
 
     # ------------------------------------------------------------------
     # Slot assignment tables
