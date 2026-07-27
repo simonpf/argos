@@ -109,7 +109,7 @@ def _draw_panels(
             lon, lat, first, norm=norm, cmap=cmap_obj, shading="nearest",
             transform=data_crs,
         )
-        ax.coastlines(resolution=coastline_resolution, linewidth=0.8)
+        ax.coastlines(resolution=coastline_resolution, linewidth=0.8, color="grey")
         ax.set_extent(
             [lon.min(), lon.max(), lat.min(), lat.max()], crs=data_crs
         )

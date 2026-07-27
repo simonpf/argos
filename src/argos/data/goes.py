@@ -92,7 +92,7 @@ class GOESObs:
         end_time = start_time + timedelta(days=1)
         time_range = TimeRange(start_time, end_time)
 
-        time = start_time
+        time = np.datetime64(start_time)
         while time < end_time:
             try:
                 recs = [
