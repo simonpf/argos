@@ -2,17 +2,10 @@
 argos.data.dataset
 ==================
 
-A PyTorch dataset for loading co-located geostationary observations and GPM
-reference data extracted into per-time-step ``.zarr`` stores.
+An interface to extract training data for the Argos multi-satellite precipitation retrieval
+system. The interface combines preprocessed observations from geostationary and polar-orbiting
+satellites and combines them with reference precipitation estimates from GPROF V08.
 
-The training data is organized into one sub-directory per sensor, for example::
-
-    training_data/
-        goes16/      goes16_<timestamp>.zarr
-        goes18/      goes18_<timestamp>.zarr
-        seviri/      seviri_<timestamp>.zarr
-        seviri_io/   seviri_io_<timestamp>.zarr
-        gprof_gmi/   gprof_gmi_<timestamp>.zarr
 
 Each input (geostationary) store holds an ``obs`` array of shape
 ``(channel, 7200, 14400)`` on a global 0.025-degree grid, while the reference
@@ -40,7 +33,7 @@ import html
 import logging
 from pathlib import Path
 import re
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
 import warnings
 
 import numpy as np
@@ -66,8 +59,8 @@ OBS_CELL = 80  # Input (0.025-degree) pixels per availability cell.
 REF_CELL = 40  # Reference (0.05-degree) pixels per availability cell.
 RESOLUTION_RATIO = OBS_CELL // REF_CELL  # Input pixels per reference pixel.
 
-DEFAULT_INPUT_SENSORS = ("goes16", "goes18", "seviri", "seviri_io")
-DEFAULT_MICROWAVE_SENSORS = (
+DEFAULT_INPUT_SATELLITES = ("goes16", "goes18", "goes19", "seviri", "seviri_io")
+DEFAULT_MICROWAVE_SATELLITES = (
     "noaa20_atms", "npp_atms",
     "f16_ssmis", "f17_ssmis", "f18_ssmis", "f19_ssmis",
     "noaa18_mhs", "noaa19_mhs", "metopa_mhs", "metopb_mhs", "metopc_mhs",
@@ -75,267 +68,37 @@ DEFAULT_MICROWAVE_SENSORS = (
 )
 DEFAULT_REFERENCE = "gprof_gmi"
 
-# ----------------------------------------------------------------------
-# Channel slotting
-# ----------------------------------------------------------------------
-# Different geostationary imagers carry different numbers of channels at
-# slightly different wavelengths. To present them to a model through a single,
-# fixed tensor we map every sensor's channels onto a common set of ``N_SLOTS``
-# spectral slots. Slots 0-15 are the GOES ABI band set (the most complete
-# 16-channel imager here); each sensor channel is assigned to the ABI slot with
-# the nearest central wavelength. The final slot is a catch-all for visible
-# bands without an ABI counterpart (the Himawari green and the SEVIRI HRV band);
-# no sensor carries both, so they share it. Slots a sensor lacks are left empty
-# (NaN).
-N_SLOTS = 17
-EXTRA_SLOT = N_SLOTS - 1  # Catch-all slot for bands without an ABI counterpart.
-
-# Canonical slot center wavelengths in micrometers (GOES ABI bands 1-16, then the
-# extra visible slot which has no fixed wavelength) and a short label for each.
-SLOT_WAVELENGTHS = (
-    0.47, 0.64, 0.86, 1.37, 1.6, 2.2, 3.9, 6.2,
-    6.9, 7.3, 8.4, 9.6, 10.3, 11.2, 12.3, 13.3, np.nan,
+from argos.data.satellite import (  # noqa: E402
+    N_SLOTS, N_MW_SLOTS, EXTRA_SLOT,
+    SLOT_WAVELENGTHS, SLOT_NAMES, MW_SLOTS, MW_SLOT_NAMES,
+    get_satellite,
 )
-SLOT_NAMES = (
-    "blue", "red", "veggie", "cirrus", "snow/ice", "cloud particle",
-    "shortwave IR", "upper WV", "mid WV", "lower WV", "cloud phase", "ozone",
-    "clean IR window", "IR window", "dirty IR window", "CO2",
-    "extra visible (green/HRV)",
-)
-
-# Nominal channel center wavelengths (micrometers) in the order the channels are
-# stored in each sensor's ``obs`` array.
-SENSOR_WAVELENGTHS = {
-    "goes16": (
-        0.47, 0.64, 0.86, 1.37, 1.6, 2.2, 3.9, 6.2,
-        6.9, 7.3, 8.4, 9.6, 10.3, 11.2, 12.3, 13.3,
-    ),
-    "goes18": (
-        0.47, 0.64, 0.86, 1.37, 1.6, 2.2, 3.9, 6.2,
-        6.9, 7.3, 8.4, 9.6, 10.3, 11.2, 12.3, 13.3,
-    ),
-    "himawari9": (
-        0.455, 0.51, 0.645, 0.86, 1.61, 2.26, 3.85, 6.25,
-        6.95, 7.3, 8.6, 9.63, 10.45, 11.2, 12.3, 13.3,
-    ),
-    "seviri": (
-        0.75, 0.63, 0.81, 1.63, 3.9, 6.25, 7.35, 8.7, 9.66, 10.8, 12.0, 13.4,
-    ),
-    "seviri_io": (
-        0.75, 0.63, 0.81, 1.63, 3.9, 6.25, 7.35, 8.7, 9.66, 10.8, 12.0, 13.4,
-    ),
-}
-
-
-def _build_slot_map(wavelengths: Sequence[float]) -> List[int]:
-    """
-    Assign each channel to a slot, returning a slot index per channel.
-
-    Channels are matched to the nearest ABI slot (slots with a defined
-    wavelength) by central wavelength. If several channels of a sensor fall onto
-    the same ABI slot only the closest is kept. Channels left without an ABI slot
-    (e.g. the Himawari green and the SEVIRI HRV bands) are placed in the
-    catch-all :data:`EXTRA_SLOT`.
-    """
-    abi_slots = [(i, wl) for i, wl in enumerate(SLOT_WAVELENGTHS) if np.isfinite(wl)]
-    result = [-1] * len(wavelengths)
-    assigned: Dict[int, Tuple[int, float]] = {}
-    for channel, wavelength in enumerate(wavelengths):
-        slot, distance = min(
-            ((i, abs(wavelength - wl)) for i, wl in abi_slots), key=lambda t: t[1]
-        )
-        if slot in assigned:
-            if distance < assigned[slot][1]:
-                result[assigned[slot][0]] = -1
-                assigned[slot] = (channel, distance)
-                result[channel] = slot
-        else:
-            assigned[slot] = (channel, distance)
-            result[channel] = slot
-    # Channels without an ABI counterpart go to the catch-all extra slot.
-    for channel in range(len(wavelengths)):
-        if result[channel] == -1:
-            result[channel] = EXTRA_SLOT
-    return result
-
-
-# Mapping of sensor name to a list (one entry per stored channel) giving the
-# target slot index, or ``-1`` for channels without a slot.
-CHANNEL_SLOTS = {
-    sensor: _build_slot_map(wavelengths)
-    for sensor, wavelengths in SENSOR_WAVELENGTHS.items()
-}
-
-
-# ----------------------------------------------------------------------
-# Microwave channel slotting (ATMS + SSMIS)
-# ----------------------------------------------------------------------
-# Microwave channels are slotted by ``(frequency, 183-GHz water-vapor offset,
-# polarization)``. V/QV and H/QH share a polarization class. Channels are
-# assigned to the nearest slot of the same polarization class.
-N_MW_SLOTS = 16
-
-# Canonical microwave slots: (frequency [GHz], 183-GHz offset [GHz], pol class).
-# Slot 14 is the V-polarized 157 GHz MHS channel, which has no counterpart among
-# the conically-scanning imagers (their 157 GHz is H-polarized); the MHS 190.31
-# GHz channel equals 183.31 + 7 GHz and is matched to the 183±7 slot. Slot 15 is
-# the cross-track TROPICS 91.655 GHz window channel, whose polarization is neither
-# H nor V ("TMS"). The TROPICS 184/186/190 GHz water-vapor channels share the
-# 183±1/±3/±7 slots and the 204.8 GHz window channel the 157/165 GHz slot.
-MW_SLOTS = (
-    (19.35, 0.0, "V"), (19.35, 0.0, "H"),
-    (22.5, 0.0, "V"), (31.4, 0.0, "V"),
-    (37.0, 0.0, "V"), (37.0, 0.0, "H"),
-    (89.5, 0.0, "V"), (91.65, 0.0, "H"),
-    (157.0, 0.0, "H"),
-    (183.31, 1.0, "H"), (183.31, 1.8, "H"), (183.31, 3.0, "H"),
-    (183.31, 4.5, "H"), (183.31, 6.8, "H"),
-    (157.0, 0.0, "V"),
-    (91.655, 0.0, "TMS"),
-)
-MW_SLOT_NAMES = (
-    "19V", "19H", "23V", "31V", "37V", "37H", "89V", "89H", "157H",
-    "183±1", "183±1.8", "183±3", "183±4.5", "183±7",
-    "157V",
-    "91 (TMS)",
-)
-
-# Per-sensor channels as (frequency [GHz], offset [GHz], polarization) in the
-# order the channels are stored in each sensor's ``obs`` array.
-_ATMS_CHANNELS = (
-    (23.8, 0.0, "V"), (31.4, 0.0, "V"), (88.2, 0.0, "V"), (165.5, 0.0, "H"),
-    (183.31, 7.0, "H"), (183.31, 4.5, "H"), (183.31, 3.0, "H"),
-    (183.31, 1.8, "H"), (183.31, 1.0, "H"),
-)
-_SSMIS_CHANNELS = (
-    (19.35, 0.0, "V"), (19.35, 0.0, "H"), (22.235, 0.0, "V"),
-    (37.0, 0.0, "V"), (37.0, 0.0, "H"), (150.0, 0.0, "H"),
-    (183.31, 6.6, "H"), (183.31, 3.0, "H"), (183.31, 1.0, "H"),
-    (91.65, 0.0, "V"), (91.65, 0.0, "H"),
-)
-_MHS_CHANNELS = (
-    (89.0, 0.0, "V"), (157.0, 0.0, "V"),
-    (183.31, 1.0, "H"), (183.31, 3.0, "H"),
-    # 190.31 GHz = 183.31 + 7, matched to the 183±7 slot.
-    (183.31, 7.0, "H"),
-)
-# TROPICS Microwave Sounder, in the stored swath/channel order. Its polarization
-# is neither H nor V, so the 91.655 GHz window uses a dedicated "TMS" slot, while
-# the 184/186/190 GHz water-vapor channels share the 183±1/±3/±7 slots and the
-# 204.80 GHz window channel the 157/165 GHz slot (explicit slot indices).
-_TMS_CHANNELS = (
-    (91.655, 0.0, "TMS"),
-    9,   # 184.41 GHz (183.31 + 1.1) -> 183±1
-    11,  # 186.51 GHz (183.31 + 3.2) -> 183±3
-    13,  # 190.31 GHz (183.31 + 7.0) -> 183±7
-    8,   # 204.80 GHz window -> 157/165
-)
-MW_SENSOR_CHANNELS = {
-    "noaa20_atms": _ATMS_CHANNELS,
-    "npp_atms": _ATMS_CHANNELS,
-    "f16_ssmis": _SSMIS_CHANNELS,
-    "f17_ssmis": _SSMIS_CHANNELS,
-    "f18_ssmis": _SSMIS_CHANNELS,
-    "f19_ssmis": _SSMIS_CHANNELS,
-    "noaa18_mhs": _MHS_CHANNELS,
-    "noaa19_mhs": _MHS_CHANNELS,
-    "metopa_mhs": _MHS_CHANNELS,
-    "metopb_mhs": _MHS_CHANNELS,
-    "metopc_mhs": _MHS_CHANNELS,
-    "tropics03_tms": _TMS_CHANNELS,
-    "tropics05_tms": _TMS_CHANNELS,
-    "tropics06_tms": _TMS_CHANNELS,
-}
-
-
-def _pol_class(pol: str) -> str:
-    """
-    Map a polarization to its class (V/QV -> 'V', H/QH -> 'H').
-
-    Other labels (e.g. the cross-track TROPICS channels, whose polarization is
-    neither H nor V) are returned unchanged and so form their own class.
-    """
-    pol = pol.upper()
-    if pol in ("V", "QV"):
-        return "V"
-    if pol in ("H", "QH"):
-        return "H"
-    return pol
-
-
-def _build_mw_slot_map(
-    channels: Sequence[Union[int, Tuple[float, float, str]]]
-) -> List[int]:
-    """
-    Assign each microwave channel to a slot, returning a slot index per channel.
-
-    A channel given as ``(frequency, offset, polarization)`` is matched to the
-    nearest slot of the same polarization class; if several channels of a sensor
-    fall onto the same slot only the closest is kept. A channel given as a plain
-    ``int`` is assigned that slot index explicitly.
-    """
-    result = [-1] * len(channels)
-    assigned: Dict[int, Tuple[int, float]] = {}
-    for channel, spec in enumerate(channels):
-        if isinstance(spec, int):
-            result[channel] = spec
-            continue
-        freq, offset, pol = spec
-        pc = _pol_class(pol)
-        candidates = [
-            (i, (freq - sf) ** 2 + (offset - so) ** 2)
-            for i, (sf, so, sp) in enumerate(MW_SLOTS)
-            if sp == pc
-        ]
-        if not candidates:
-            continue
-        slot, distance = min(candidates, key=lambda t: t[1])
-        if slot in assigned:
-            if distance < assigned[slot][1]:
-                result[assigned[slot][0]] = -1
-                assigned[slot] = (channel, distance)
-                result[channel] = slot
-        else:
-            assigned[slot] = (channel, distance)
-            result[channel] = slot
-    return result
-
-
-MW_CHANNEL_SLOTS = {
-    sensor: _build_mw_slot_map(channels)
-    for sensor, channels in MW_SENSOR_CHANNELS.items()
-}
 
 
 def slot_observations(
-    obs: np.ndarray, sensor: str, fill: float = np.nan
+    obs: np.ndarray, satellite: str, fill: float = np.nan
 ) -> np.ndarray:
     """
-    Map a sensor's observations onto its common set of channel slots.
+    Map a satellite's observations onto its common set of channel slots.
 
-    Geostationary sensors are mapped onto the :data:`N_SLOTS` spectral slots and
-    microwave sensors onto the :data:`N_MW_SLOTS` frequency slots, depending on
-    which slotting scheme the sensor belongs to.
+    Geostationary satellites are mapped onto the :data:`N_SLOTS` spectral slots
+    and microwave satellites onto the :data:`N_MW_SLOTS` frequency slots.
 
     Args:
-        obs: An observation array of shape ``(channels, ...)`` in the sensor's
-            stored channel order.
-        sensor: The sensor name.
-        fill: Value used for slots the sensor does not provide.
+        obs: An observation array of shape ``(channels, ...)`` in the
+            satellite's stored channel order.
+        satellite: The satellite name (must match a TOML definition).
+        fill: Value used for slots the satellite does not provide.
 
     Returns:
         An array of shape ``(n_slots, ...)`` with each channel placed in its
         slot and missing slots set to ``fill``.
     """
-    if sensor in CHANNEL_SLOTS:
-        slots, n_slots = CHANNEL_SLOTS[sensor], N_SLOTS
-    elif sensor in MW_CHANNEL_SLOTS:
-        slots, n_slots = MW_CHANNEL_SLOTS[sensor], N_MW_SLOTS
-    else:
-        raise KeyError(f"No channel slotting defined for sensor '{sensor}'.")
+    sat = get_satellite(satellite)
+    slots, n_slots = sat.slots, sat.n_slots
     if obs.shape[0] != len(slots):
         raise ValueError(
-            f"'{sensor}' observations have {obs.shape[0]} channels but the "
+            f"'{satellite}' observations have {obs.shape[0]} channels but the "
             f"slotting scheme expects {len(slots)}."
         )
     out = np.full((n_slots,) + obs.shape[1:], fill, dtype=np.float32)
@@ -473,7 +236,7 @@ class _SampleIndex:
             )
 
 
-class ArgosTrainingData(Dataset):
+class ArgosData(Dataset):
     """
     Dataset pairing geostationary observations with GPM surface precipitation.
 
@@ -487,8 +250,8 @@ class ArgosTrainingData(Dataset):
     def __init__(
         self,
         path: Union[str, Path],
-        input_sensors: Sequence[str] = DEFAULT_INPUT_SENSORS,
-        microwave_sensors: Sequence[str] = DEFAULT_MICROWAVE_SENSORS,
+        input_satellites: Sequence[str] = DEFAULT_INPUT_SATELLITES,
+        microwave_satellites: Sequence[str] = DEFAULT_MICROWAVE_SATELLITES,
         reference_name: str = DEFAULT_REFERENCE,
         tile_size: int = 128,
         time_window: np.timedelta64 = np.timedelta64(10, "m"),
@@ -499,42 +262,42 @@ class ArgosTrainingData(Dataset):
     ):
         """
         Args:
-            path: Root directory containing the per-sensor sub-directories.
-            input_sensors: Names of the geostationary sensor sub-directories to
-                use as the high-resolution ``"geo"`` input.
-            microwave_sensors: Names of the microwave sensor sub-directories
-                (ATMS, SSMIS, ...) to use as the ``"mw"`` input. These are on the
-                lower (reference) resolution grid and, like the reference, have a
-                per-cell scan time.
+            path: Root directory containing the per-satellite sub-directories.
+            input_satellites: Names of the geostationary satellite
+                sub-directories to use as the high-resolution ``"geo"`` input.
+            microwave_satellites: Names of the microwave satellite
+                sub-directories (ATMS, SSMIS, ...) to use as the ``"mw"``
+                input. These are on the lower (reference) resolution grid and,
+                like the reference, have a per-cell scan time.
             reference_name: Name of the reference sub-directory.
             tile_size: Side length of the (square) reference tile in reference
                 pixels. The input tile has side length
                 ``tile_size * RESOLUTION_RATIO``.
             time_window: Maximum allowed difference between an input
                 acquisition time and a reference cell's scan time.
-            position_jitter: Maximum random shift of the tile center applied when
-                loading a sample, in reference (0.05-degree) pixels (and
-                ``RESOLUTION_RATIO`` times as many input pixels). Defaults to half
-                an availability cell (20 reference / 40 input pixels). Set to 0 to
-                disable jittering.
-            slot_channels: If ``True`` (the default), the loaded sensor's
+            position_jitter: Maximum random shift of the tile center applied
+                when loading a sample, in reference (0.05-degree) pixels (and
+                ``RESOLUTION_RATIO`` times as many input pixels). Defaults to
+                half an availability cell (20 reference / 40 input pixels). Set
+                to 0 to disable jittering.
+            slot_channels: If ``True`` (the default), the loaded satellite's
                 observations are mapped onto the common spectral slots (see
                 :func:`slot_observations`) and returned as the ``"geo"`` and
-                ``"mw"`` inputs of shape ``(n_slots, H, W)`` (absent bands set to
-                ``NaN``). If ``False``, the raw observation tensor of the loaded
-                sensor is returned under the sensor's name.
+                ``"mw"`` inputs of shape ``(n_slots, H, W)`` (absent bands set
+                to ``NaN``). If ``False``, the raw observation tensor of the
+                loaded satellite is returned under the satellite's name.
             normalize: If ``True`` (the default), the loaded observations are
-                scaled to ``[0, 1]`` per channel using the sensor-wise
-                :attr:`normalization_stats` (min/max across all of the sensor's
-                stores).
-            require_both_inputs: If ``True``, only keep samples that have both a
-                geostationary and a microwave observation (by default a sample is
-                kept if it has either).
+                scaled to ``[0, 1]`` per channel using the satellite-wise
+                :attr:`normalization_stats` (min/max across all of the
+                satellite's stores).
+            require_both_inputs: If ``True``, only keep samples that have both
+                a geostationary and a microwave observation (by default a sample
+                is kept if it has either).
         """
         super().__init__()
         self.path = Path(path)
-        self.input_sensors = tuple(input_sensors)
-        self.microwave_sensors = tuple(microwave_sensors)
+        self.input_satellites = tuple(input_satellites)
+        self.microwave_satellites = tuple(microwave_satellites)
         self.reference_name = reference_name
         self.tile_size = int(tile_size)
         self.time_window = np.timedelta64(time_window, "ns")
@@ -548,11 +311,10 @@ class ArgosTrainingData(Dataset):
                 f"A tile_size of {self.tile_size} exceeds the global grid."
             )
 
-        # Group each input sensor as high-resolution geo ("geo") or
-        # reference-resolution microwave ("mw").
-        self._sensor_group = {
-            **{sensor: "geo" for sensor in self.input_sensors},
-            **{sensor: "mw" for sensor in self.microwave_sensors},
+        # Map each satellite name to its type ("geo" or "mw") from the registry.
+        self._satellite_group = {
+            **{sat: "geo" for sat in self.input_satellites},
+            **{sat: "mw" for sat in self.microwave_satellites},
         }
 
     # ``DataLoader(worker_init_fn=...)`` helper to seed NumPy per worker.
@@ -563,18 +325,18 @@ class ArgosTrainingData(Dataset):
     # ------------------------------------------------------------------
     @cached_property
     def geo_files(self) -> Dict[str, List[Path]]:
-        """Mapping of each input sensor name to its sorted list of '.zarr' stores."""
+        """Mapping of each input satellite name to its sorted list of '.zarr' stores."""
         return {
-            sensor: sorted((self.path / sensor).glob("*.zarr"))
-            for sensor in self.input_sensors
+            sat: sorted((self.path / sat).glob("*.zarr"))
+            for sat in self.input_satellites
         }
 
     @cached_property
     def mw_files(self) -> Dict[str, List[Path]]:
-        """Mapping of each microwave sensor name to its sorted '.zarr' stores."""
+        """Mapping of each microwave satellite name to its sorted '.zarr' stores."""
         return {
-            sensor: sorted((self.path / sensor).glob("*.zarr"))
-            for sensor in self.microwave_sensors
+            sat: sorted((self.path / sat).glob("*.zarr"))
+            for sat in self.microwave_satellites
         }
 
     @cached_property
@@ -601,46 +363,52 @@ class ArgosTrainingData(Dataset):
         """
         return sorted((self.path / name).glob("*.zarr"))
 
-    def _load_indices(self, sensors, compute) -> Dict[str, xr.Dataset]:
+    def _load_indices(self, satellites, compute) -> Dict[str, xr.Dataset]:
         """
-        Load (or compute and cache) the per-sensor index of each named dataset.
+        Load (or compute and cache) the per-satellite index of each named dataset.
 
-        Returns a mapping of name to its index dataset, skipping names with no
-        stores. The cached ``index_<name>.nc`` already records the store
-        filenames, so the (slow) directory listing is only performed for a sensor
-        whose index is missing or predates the per-channel ``obs_min``/
-        ``obs_max`` statistics.
+        Returns a mapping of name to its index dataset (availability and time
+        only; normalization stats are kept in separate files under
+        ``.argos/stats/``). Both the index and the stats are (re)computed if
+        either is missing.
         """
         indices = {}
-        for name in sensors:
-            meta = self._read_index(name)
-            if meta is None or "obs_min" not in meta:
+        for name in satellites:
+            index_ok = self._index_path(name).exists()
+            stats_ok = self._stats_path(name).exists()
+            if not index_ok or not stats_ok:
                 meta = compute(name, self._list_stores(name))
                 self._write_index(name, meta)
-            if meta.sizes["samples"] > 0:
-                indices[name] = meta
+                self._write_stats(name, meta)
+            else:
+                meta = self._read_index(name)
+            if meta is not None and meta.sizes["samples"] > 0:
+                indices[name] = meta.drop_vars(
+                    ["obs_min", "obs_max"], errors="ignore"
+                )
         return indices
 
     @cached_property
     def geo_meta(self) -> Dict[str, xr.Dataset]:
         """
-        Per-sensor availability and acquisition time of the geostationary inputs.
+        Per-satellite availability and acquisition time of the geostationary inputs.
 
-        A mapping of sensor name to its own :class:`xarray.Dataset` (kept
-        separate, not concatenated across sensors). Each dataset holds
+        A mapping of satellite name to its own :class:`xarray.Dataset` (kept
+        separate, not concatenated across satellites). Each dataset holds
         ``availability`` (``(samples, lat_cell, lon_cell)`` boolean), the scalar
         ``time`` (``(samples,)`` ``datetime64[ns]``), the per-channel
         ``obs_min``/``obs_max`` statistics and a ``filename`` coordinate (the
         full store path is built on the fly with :meth:`_store_path`). The
-        per-sensor metadata is cached to ``index_<sensor>.nc`` and loaded from
-        there on subsequent runs (see :meth:`recompute_indices` to refresh).
+        per-satellite metadata is cached to ``index_<satellite>.nc`` and loaded
+        from there on subsequent runs (see :meth:`recompute_indices` to refresh).
         """
-        return self._load_indices(self.input_sensors, self._compute_geo_meta)
+        return self._load_indices(self.input_satellites, self._compute_geo_meta)
 
-    def _compute_geo_meta(self, sensor: str, files: List[Path]) -> xr.Dataset:
-        """Read the availability and acquisition time of one sensor's stores."""
+    def _compute_geo_meta(self, satellite: str, files: List[Path]) -> xr.Dataset:
+        """Read the availability and acquisition time of one satellite's stores."""
+        sensor = satellite  # local alias for log messages / tqdm labels
         LOGGER.info(
-            "Loading metadata for input sensor '%s' (%d files).", sensor, len(files)
+            "Loading metadata for input satellite '%s' (%d files).", sensor, len(files)
         )
         names: List[str] = []
         avail: List[np.ndarray] = []
@@ -714,6 +482,7 @@ class ArgosTrainingData(Dataset):
                 )
             meta = self._compute_reference_meta(name, files)
             self._write_index(name, meta)
+            self._write_stats(name, meta)
         if meta.sizes["samples"] == 0:
             raise FileNotFoundError("No reference '.zarr' stores found.")
         return meta
@@ -728,7 +497,7 @@ class ArgosTrainingData(Dataset):
         on the reference grid. Empty if there are no microwave stores.
         """
         return self._load_indices(
-            self.microwave_sensors, self._compute_reference_meta
+            self.microwave_satellites, self._compute_reference_meta
         )
 
     @property
@@ -746,18 +515,19 @@ class ArgosTrainingData(Dataset):
         return self.samples.norm_stats
 
     def _compute_normalization_stats(self) -> Dict[str, Dict[str, np.ndarray]]:
-        """Per-channel min/max across each sensor's stores (built with samples)."""
+        """Per-channel min/max from the stats files under ``.argos/stats/``."""
         stats = {}
-        for sensor, idx in {**self.geo_meta, **self.microwave_meta}.items():
-            if "obs_min" not in idx:
+        for sensor in (*self.input_satellites, *self.microwave_satellites):
+            ds = self._read_stats(sensor)
+            if ds is None or "obs_min" not in ds:
                 continue
             # A channel that was never observed yields an all-NaN slice (and a
             # NaN stat); :meth:`_normalize` passes such channels through.
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 stats[sensor] = {
-                    "min": np.nanmin(idx["obs_min"].values, axis=0),
-                    "max": np.nanmax(idx["obs_max"].values, axis=0),
+                    "min": np.nanmin(ds["obs_min"].values, axis=0),
+                    "max": np.nanmax(ds["obs_max"].values, axis=0),
                 }
         return stats
 
@@ -832,12 +602,24 @@ class ArgosTrainingData(Dataset):
     # ------------------------------------------------------------------
     # Index caching
     # ------------------------------------------------------------------
+    @property
+    def _indices_dir(self) -> Path:
+        """Directory for compressed availability / scan-time index files."""
+        return self.path / ".argos" / "indices"
+
+    @property
+    def _stats_dir(self) -> Path:
+        """Directory for per-satellite normalization statistics files."""
+        return self.path / ".argos" / "stats"
+
     def _index_path(self, name: str) -> Path:
-        """Path of the cached metadata index for a given dataset name."""
-        return self.path / f"index_{name}.nc"
+        return self._indices_dir / f"{name}.nc"
+
+    def _stats_path(self, name: str) -> Path:
+        return self._stats_dir / f"{name}.nc"
 
     def _read_index(self, name: str) -> Optional[xr.Dataset]:
-        """Load a cached metadata index, or return ``None`` if it is absent."""
+        """Load a cached availability/time index, or ``None`` if absent."""
         path = self._index_path(name)
         if not path.exists():
             return None
@@ -845,38 +627,60 @@ class ArgosTrainingData(Dataset):
             meta = ds.load()
         LOGGER.info(
             "Loaded cached index for '%s' from '%s' (%d stores).",
-            name,
-            path,
-            meta.sizes["samples"],
+            name, path, meta.sizes["samples"],
         )
         return meta
 
     def _write_index(self, name: str, meta: xr.Dataset) -> None:
-        """Cache a metadata index to ``index_<name>.nc``."""
+        """Write the availability/time index to ``.argos/indices/`` with compression."""
         if meta.sizes["samples"] == 0:
-            # Nothing to cache; allow data that appears later to be picked up.
             return
         path = self._index_path(name)
-        meta.to_netcdf(path)
-        LOGGER.info("Wrote metadata index for '%s' to '%s'.", name, path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        index_ds = meta.drop_vars(["obs_min", "obs_max"], errors="ignore")
+        encoding = {
+            v: {"zlib": True, "complevel": 4}
+            for v in index_ds.data_vars
+        }
+        index_ds.to_netcdf(path, encoding=encoding)
+        LOGGER.info("Wrote index for '%s' to '%s'.", name, path)
+
+    def _read_stats(self, name: str) -> Optional[xr.Dataset]:
+        """Load a cached normalization-stats dataset, or ``None`` if absent."""
+        path = self._stats_path(name)
+        if not path.exists():
+            return None
+        with xr.open_dataset(path) as ds:
+            return ds.load()
+
+    def _write_stats(self, name: str, meta: xr.Dataset) -> None:
+        """Write per-file obs_min/obs_max to ``.argos/stats/``."""
+        if "obs_min" not in meta:
+            return
+        path = self._stats_path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stats_ds = meta[["obs_min", "obs_max"]]
+        stats_ds.to_netcdf(path)
+        LOGGER.info("Wrote normalization stats for '%s' to '%s'.", name, path)
 
     def recompute_indices(self) -> None:
         """
-        Delete any cached metadata indices and recompute them from the stores.
+        Delete cached indices and stats and recompute them from the stores.
 
-        This discards the ``index_<name>.nc`` files and the cached sample index so
-        that the next access re-reads the stores and rebuilds them.
+        This discards the files under ``.argos/indices/`` and ``.argos/stats/``
+        as well as the sample-index cache, so the next access re-reads all
+        stores and rebuilds everything.
         """
         names = (
-            *self.input_sensors,
-            *self.microwave_sensors,
+            *self.input_satellites,
+            *self.microwave_satellites,
             self.reference_name,
         )
         for name in names:
-            path = self._index_path(name)
-            if path.exists():
-                path.unlink()
-                LOGGER.info("Removed cached index '%s'.", path)
+            for path in (self._index_path(name), self._stats_path(name)):
+                if path.exists():
+                    path.unlink()
+                    LOGGER.info("Removed cached file '%s'.", path)
         sample_cache = self._samples_cache_path
         if sample_cache.exists():
             sample_cache.unlink()
@@ -906,19 +710,19 @@ class ArgosTrainingData(Dataset):
     # ------------------------------------------------------------------
     @cached_property
     def _samples_cache_path(self) -> Path:
-        """Path of the on-disk sample-index cache (keyed by the relevant config)."""
+        """Path of the on-disk sample-index cache under ``.argos/``."""
         key = "|".join(
             [
                 "v2",  # cache format version (bump to invalidate old caches)
-                ",".join(self.input_sensors),
-                ",".join(self.microwave_sensors),
+                ",".join(self.input_satellites),
+                ",".join(self.microwave_satellites),
                 self.reference_name,
                 str(int(self.time_window.astype("int64"))),
                 str(self.require_both_inputs),
             ]
         )
         digest = hashlib.md5(key.encode()).hexdigest()[:12]
-        return self.path / f"samples_{digest}.npz"
+        return self.path / ".argos" / f"samples_{digest}.npz"
 
     @cached_property
     def samples(self) -> _SampleIndex:
@@ -936,6 +740,7 @@ class ArgosTrainingData(Dataset):
             LOGGER.info("Loading cached sample index from '%s'.", path)
             return _SampleIndex.load(path)
         samples = self._build_samples()
+        path.parent.mkdir(parents=True, exist_ok=True)
         samples.save(path)
         LOGGER.info("Wrote sample index cache to '%s'.", path)
         return samples
@@ -944,15 +749,15 @@ class ArgosTrainingData(Dataset):
         """Enumerate samples from the metadata indices (the slow, one-off path)."""
         window = self.time_window
 
-        # Per-sensor input arrays (geo and microwave), with a per-file time span
-        # used to pre-filter candidates.
+        # Per-satellite input arrays (geo and microwave), with a per-file time
+        # span used to pre-filter candidates.
         inputs = {
-            sensor: self._sensor_arrays(meta)
-            for sensor, meta in {**self.geo_meta, **self.microwave_meta}.items()
+            sat: self._sensor_arrays(meta)
+            for sat, meta in {**self.geo_meta, **self.microwave_meta}.items()
         }
         sensors = list(inputs)
         n_sensors = len(sensors)
-        groups = np.array([self._sensor_group[s] for s in sensors])
+        groups = np.array([self._satellite_group[s] for s in sensors])
         geo_cols = list(np.where(groups == "geo")[0])
         mw_cols = list(np.where(groups == "mw")[0])
 
@@ -1091,6 +896,321 @@ class ArgosTrainingData(Dataset):
         }
 
     # ------------------------------------------------------------------
+    # Super-cell iteration
+    # ------------------------------------------------------------------
+    def iter_reference_super_cells(
+        self,
+        *,
+        subsample: int = 16,
+        rng: Optional[Union[int, "np.random.Generator"]] = None,
+        start_time: Optional[Union[str, "np.datetime64"]] = None,
+        end_time: Optional[Union[str, "np.datetime64"]] = None,
+    ) -> Iterator[Tuple[Tuple[int, int], "np.datetime64"]]:
+        """
+        Iterate over availability cells that anchor a valid reference estimate.
+
+        For each reference granule the function finds every availability cell
+        (on the 90×180 grid) that has both a ``True`` availability flag and a
+        non-NaT per-cell scan time.  Each such cell is a candidate anchor for
+        a 4×4 super-cell sample window (160×160 reference pixels, 320×320 geo
+        pixels) centred on that cell.  A random fraction ``1/subsample`` of
+        the candidates is kept; the default of 16 gives roughly one anchor per
+        4×4 block, i.e. approximately non-overlapping windows.
+
+        Args:
+            subsample: Keep each valid cell independently with probability
+                ``1/subsample``.  Default 16.
+            rng: :class:`numpy.random.Generator` or integer seed.  ``None``
+                uses :func:`numpy.random.default_rng`.
+            start_time: Optional lower bound on the per-cell scan time
+                (inclusive).  Anything accepted by ``numpy.datetime64``.
+            end_time: Optional upper bound on the per-cell scan time
+                (inclusive).
+
+        Yields:
+            ``((row, col), scan_time)`` — the availability-cell coordinate on
+            the 90×180 grid and the per-cell reference scan time
+            (``datetime64[ns]``).
+        """
+        rng = np.random.default_rng(rng)
+        t_start = np.datetime64(start_time, "ns") if start_time is not None else None
+        t_end = np.datetime64(end_time, "ns") if end_time is not None else None
+
+        ref = self.reference_meta
+        avail = ref["availability"].values.astype(bool)  # (n_files, 90, 180)
+        times = ref["time"].values                        # (n_files, 90, 180)
+
+        for f in range(avail.shape[0]):
+            valid = avail[f] & ~np.isnat(times[f])
+            if t_start is not None:
+                valid &= times[f] >= t_start
+            if t_end is not None:
+                valid &= times[f] <= t_end
+            rows, cols = np.where(valid)
+            if rows.size == 0:
+                continue
+            if subsample > 1:
+                keep = rng.random(rows.size) < (1.0 / subsample)
+                rows, cols = rows[keep], cols[keep]
+            for r, c in zip(rows.tolist(), cols.tolist()):
+                yield (r, c), times[f, r, c]
+
+    def find_slot_observations(
+        self,
+        cell: Tuple[int, int],
+        scan_time: "np.datetime64",
+        slot: int,
+        step: np.timedelta64 = np.timedelta64(20, "m"),
+        super_cell: int = 1,
+    ) -> Dict[str, List[Path]]:
+        """
+        Find available geo and MW observation files for a cell and temporal slot.
+
+        Slot 0 is the coincident slot — files whose acquisition time (geo) or
+        per-cell scan time (MW) falls within ``time_window`` of ``scan_time``.
+        Positive slot indices step back in time by ``step`` each: slot *s*
+        targets time ``scan_time - s * step``.
+
+        Args:
+            cell: Availability-cell coordinate ``(row, col)`` on the 90×180 grid.
+            scan_time: Reference per-cell scan time (from the iterator) for slot 0.
+            slot: Non-negative temporal slot index.
+            step: Time between consecutive slots (default 20 minutes).
+            super_cell: Side length in availability cells of the spatial search
+                window centred on ``cell``.  ``1`` checks only the anchor cell;
+                odd values like ``5`` or ``7`` extend the search so that files
+                covering any part of the super-cell are included.
+
+        Returns:
+            ``{"geo": [...], "mw": [...]}`` — for each group a list of
+            :class:`~pathlib.Path` objects pointing to matching ``.zarr`` stores,
+            ordered from highest to lowest satellite priority.  Files from the
+            same satellite are further sorted by the minimum temporal offset
+            between the slot target and any valid cell in the search window.
+        """
+        row, col = int(cell[0]), int(cell[1])
+        target = np.datetime64(scan_time, "ns") - slot * np.timedelta64(step, "ns")
+        window = self.time_window
+
+        half = super_cell // 2
+        r0 = max(0, row - half)
+        r1 = min(N_CELLS_LAT, row + half + 1)
+        c0 = max(0, col - half)
+        c1 = min(N_CELLS_LON, col + half + 1)
+
+        def _ns(delta: np.timedelta64) -> int:
+            return int(delta / np.timedelta64(1, "ns"))
+
+        geo_candidates: List[Tuple[int, int, Path]] = []
+        for sat_name, meta in self.geo_meta.items():
+            priority = get_satellite(sat_name).priority
+            file_times = meta["time"].values                                           # (n_files,)
+            region_avail = meta["availability"].values[:, r0:r1, c0:c1].astype(bool).any(axis=(1, 2))
+            deltas = np.abs(file_times - target)
+            for idx in np.where(region_avail & (deltas <= window))[0]:
+                path = self._store_path(sat_name, meta["filename"].values[idx])
+                geo_candidates.append((-priority, _ns(deltas[idx]), path))
+        geo_candidates.sort(key=lambda t: (t[0], t[1]))
+
+        mw_candidates: List[Tuple[int, int, Path]] = []
+        for sat_name, meta in self.microwave_meta.items():
+            priority = get_satellite(sat_name).priority
+            region_avail = meta["availability"].values[:, r0:r1, c0:c1].astype(bool)  # (n, h, w)
+            region_times = meta["time"].values[:, r0:r1, c0:c1]                        # (n, h, w)
+            valid = region_avail & ~np.isnat(region_times)
+            for idx in np.where(valid.any(axis=(1, 2)))[0]:
+                cell_deltas = np.abs(region_times[idx][valid[idx]] - target)
+                if (cell_deltas <= window).any():
+                    path = self._store_path(sat_name, meta["filename"].values[idx])
+                    mw_candidates.append((-priority, _ns(cell_deltas.min()), path))
+        mw_candidates.sort(key=lambda t: (t[0], t[1]))
+
+        return {
+            "geo": [p for _, _, p in geo_candidates],
+            "mw": [p for _, _, p in mw_candidates],
+        }
+
+    def plot_sample(
+        self,
+        cell: Tuple[int, int],
+        scan_time: "np.datetime64",
+        slot: int = 0,
+        geo_channels: Tuple[int, ...] = (1, 6, 12, 7),
+        mw_channels: Tuple[int, ...] = (0, 2, 6, 9),
+        layer: int = 0,
+        step: np.timedelta64 = np.timedelta64(20, "m"),
+    ) -> "matplotlib.figure.Figure":
+        """
+        Plot geo channels, MW channels and reference precipitation for a sample.
+
+        Three-row figure:
+
+        * **Row 0** — four geostationary images (``geo_channels`` slot indices)
+          with satellite name and filename to the left.
+        * **Row 1** — four microwave images (``mw_channels`` slot indices) with
+          satellite name, filename and per-cell scan time to the left.
+        * **Row 2** — surface precipitation from the reference dataset.
+
+        The suptitle shows the reference scan time and, when ``slot > 0``, the
+        target time for the slot.  ``layer`` selects which file to display when
+        multiple files match; it is clamped to the last available file.
+
+        Args:
+            cell: Availability-cell coordinate ``(row, col)`` on the 90×180 grid.
+            scan_time: Reference per-cell scan time (slot-0 anchor, from the
+                iterator).
+            slot: Temporal slot index (0 = coincident; higher = further back).
+            geo_channels: Four geo slot indices to display (default: red,
+                shortwave IR, clean IR window, upper WV).
+            mw_channels: Four MW slot indices to display (default: 19V, 23V,
+                89V, 183±1).
+            layer: Index into the priority-sorted file list returned by
+                :meth:`find_slot_observations` (clamped to last element).
+            step: Time between consecutive slots (default 20 minutes).
+
+        Returns:
+            The :class:`matplotlib.figure.Figure`.
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+
+        row, col = int(cell[0]), int(cell[1])
+
+        # 4×4 super-cell pixel windows, clamped to global grid bounds.
+        obs_size = 4 * OBS_CELL   # 320 geo pixels
+        ref_size = 4 * REF_CELL   # 160 reference pixels
+        obs_r0 = min(max((row - 2) * OBS_CELL, 0), N_CELLS_LAT * OBS_CELL - obs_size)
+        obs_c0 = min(max((col - 2) * OBS_CELL, 0), N_CELLS_LON * OBS_CELL - obs_size)
+        ref_r0 = obs_r0 // RESOLUTION_RATIO
+        ref_c0 = obs_c0 // RESOLUTION_RATIO
+
+        # Resolve geo / MW files for this slot.
+        obs = self.find_slot_observations(cell, scan_time, slot, step=step)
+        geo_list, mw_list = obs["geo"], obs["mw"]
+        geo_path = geo_list[min(layer, len(geo_list) - 1)] if geo_list else None
+        mw_path = mw_list[min(layer, len(mw_list) - 1)] if mw_list else None
+
+        # Resolve the reference file from scan_time.
+        ref_meta = self.reference_meta
+        cell_times = ref_meta["time"].values[:, row, col]
+        matches = np.where(cell_times == np.datetime64(scan_time, "ns"))[0]
+        ref_path = (
+            self._store_path(
+                self.reference_name,
+                str(ref_meta["filename"].values[matches[0]]),
+            )
+            if matches.size > 0 else None
+        )
+
+        # Layout: narrow text column (0) + 4 image columns (1–4).
+        fig = plt.figure(figsize=(17, 11))
+        gs = gridspec.GridSpec(
+            3, 5, figure=fig,
+            width_ratios=[1.4, 3, 3, 3, 3],
+            hspace=0.45, wspace=0.25,
+        )
+        title = f"Reference time: {str(np.datetime64(scan_time, 's'))}"
+        if slot > 0:
+            target = np.datetime64(scan_time, "ns") - slot * np.timedelta64(step, "ns")
+            title += f"   |   Slot {slot} → {str(np.datetime64(target, 's'))}"
+        fig.suptitle(title, fontsize=11)
+
+        # ---- Row 0: geostationary channels ----
+        ax_lbl = fig.add_subplot(gs[0, 0])
+        ax_lbl.axis("off")
+        if geo_path is not None:
+            sat_name = geo_path.parent.name
+            raw = self._load_obs(geo_path, obs_r0, obs_c0, obs_size)
+            slotted = slot_observations(raw, sat_name)
+            ax_lbl.text(
+                0.5, 0.5,
+                f"{sat_name}\n{geo_path.name}",
+                ha="center", va="center", fontsize=7, rotation=90,
+                transform=ax_lbl.transAxes,
+            )
+            for i, ch in enumerate(geo_channels):
+                ax = fig.add_subplot(gs[0, i + 1])
+                data = (
+                    slotted[ch]
+                    if ch < slotted.shape[0]
+                    else np.full(slotted.shape[1:], np.nan)
+                )
+                ax.imshow(data, cmap="gray", origin="upper", aspect="auto",
+                          interpolation="nearest")
+                lbl = SLOT_NAMES[ch] if ch < len(SLOT_NAMES) else f"slot {ch}"
+                ax.set_title(f"{ch}: {lbl}", fontsize=8)
+                ax.set_xticks([])
+                ax.set_yticks([])
+        else:
+            ax_lbl.text(0.5, 0.5, "No geo\ndata", ha="center", va="center",
+                        fontsize=9, transform=ax_lbl.transAxes)
+            for i in range(4):
+                fig.add_subplot(gs[0, i + 1]).axis("off")
+
+        # ---- Row 1: microwave channels ----
+        ax_lbl = fig.add_subplot(gs[1, 0])
+        ax_lbl.axis("off")
+        if mw_path is not None:
+            sat_name = mw_path.parent.name
+            label_parts = [sat_name, mw_path.name]
+            mw_meta = self.microwave_meta.get(sat_name)
+            if mw_meta is not None:
+                filenames = [self._as_str(f) for f in mw_meta["filename"].values]
+                try:
+                    fidx = filenames.index(mw_path.name)
+                    t = mw_meta["time"].values[fidx, row, col]
+                    if not np.isnat(t):
+                        label_parts.append(str(np.datetime64(t, "s")))
+                except ValueError:
+                    pass
+            ax_lbl.text(
+                0.5, 0.5,
+                "\n".join(label_parts),
+                ha="center", va="center", fontsize=7, rotation=90,
+                transform=ax_lbl.transAxes,
+            )
+            raw = self._load_mw_obs(mw_path, ref_r0, ref_c0, ref_size)
+            slotted = slot_observations(raw, sat_name)
+            for i, ch in enumerate(mw_channels):
+                ax = fig.add_subplot(gs[1, i + 1])
+                data = (
+                    slotted[ch]
+                    if ch < slotted.shape[0]
+                    else np.full(slotted.shape[1:], np.nan)
+                )
+                ax.imshow(data, cmap="viridis", origin="upper", aspect="auto",
+                          interpolation="nearest")
+                lbl = MW_SLOT_NAMES[ch] if ch < len(MW_SLOT_NAMES) else f"slot {ch}"
+                ax.set_title(f"{ch}: {lbl}", fontsize=8)
+                ax.set_xticks([])
+                ax.set_yticks([])
+        else:
+            ax_lbl.text(0.5, 0.5, "No MW\ndata", ha="center", va="center",
+                        fontsize=9, transform=ax_lbl.transAxes)
+            for i in range(4):
+                fig.add_subplot(gs[1, i + 1]).axis("off")
+
+        # ---- Row 2: reference precipitation ----
+        for i in range(1, 5):
+            fig.add_subplot(gs[2, i]).axis("off")
+        ax_ref = fig.add_subplot(gs[2, 1])
+        if ref_path is not None:
+            sp = self._load_reference(ref_path, ref_r0, ref_c0, ref_size)
+            im = ax_ref.imshow(sp, cmap="Blues", origin="upper", aspect="auto",
+                               vmin=0, interpolation="nearest")
+            plt.colorbar(im, ax=ax_ref, label="mm/h", fraction=0.015, pad=0.02)
+            ax_ref.set_title(
+                f"Surface precipitation ({self.reference_name})", fontsize=9
+            )
+        else:
+            ax_ref.text(0.5, 0.5, "No reference data", ha="center", va="center",
+                        fontsize=10, transform=ax_ref.transAxes)
+        ax_ref.set_xticks([])
+        ax_ref.set_yticks([])
+
+        return fig
+
+    # ------------------------------------------------------------------
     # Sample loading
     # ------------------------------------------------------------------
     @staticmethod
@@ -1185,11 +1305,11 @@ class ArgosTrainingData(Dataset):
         if not np.isfinite(surface_precip).any():
             return self[np.random.randint(len(self))]
 
-        # For each input group, randomly choose one of the available sensors and
-        # load its observations. ``"geo"`` is high resolution, ``"mw"`` is on the
-        # reference grid. When slotting, the observations are mapped onto the
-        # group's common slots; otherwise the raw tensor is returned under the
-        # sensor name.
+        # For each input group, choose one of the available satellites weighted
+        # by priority and load its observations. ``"geo"`` is high resolution,
+        # ``"mw"`` is on the reference grid. When slotting, the observations
+        # are mapped onto the group's common slots; otherwise the raw tensor is
+        # returned under the satellite's name.
         sensor_file = si.sensor_file[index]
         obs = {}
         for group, columns, loader, (r0, c0, size) in (
@@ -1199,16 +1319,21 @@ class ArgosTrainingData(Dataset):
             present = columns[sensor_file[columns] >= 0]
             if present.size == 0:
                 continue
-            col = int(np.random.choice(present))
-            sensor = str(si.sensors[col])
-            filename = si.filenames[sensor][sensor_file[col]]
-            array = loader(self._store_path(sensor, filename), r0, c0, size)
+            priorities = np.array(
+                [get_satellite(str(si.sensors[c])).priority for c in present],
+                dtype=float,
+            )
+            weights = priorities / priorities.sum()
+            col = int(np.random.choice(present, p=weights))
+            satellite = str(si.sensors[col])
+            filename = si.filenames[satellite][sensor_file[col]]
+            array = loader(self._store_path(satellite, filename), r0, c0, size)
             if self.normalize:
-                array = self._normalize(array, sensor)
+                array = self._normalize(array, satellite)
             if self.slot_channels:
-                obs[group] = torch.from_numpy(slot_observations(array, sensor))
+                obs[group] = torch.from_numpy(slot_observations(array, satellite))
             else:
-                obs[sensor] = torch.from_numpy(array)
+                obs[satellite] = torch.from_numpy(array)
 
         inputs = {
             **obs,
@@ -1630,6 +1755,7 @@ class ArgosTrainingData(Dataset):
                 ref_r0, ref_c0, self.tile_size,
             )
             store["coordinates"][i] = (row_c, col_c)
+            print("TIMES :: ", slot_time, sample_times[index].astype("int64"))
             store["time"][i] = sample_times[index].astype("int64")
             store["geo_sensor"][i] = geo_col
             store["step_time"][i] = np.array(
@@ -1675,6 +1801,246 @@ class ArgosTrainingData(Dataset):
             store["mw_sensor"][i] = mw_sensor
 
         LOGGER.info("Wrote %d temporal scenes to '%s'.", n_scenes, output_path)
+        return output_path
+
+    def extract_super_cell_samples(
+        self,
+        output_path: Union[str, Path],
+        n_steps: int = 0,
+        scene_size: int = 5,
+        step: np.timedelta64 = np.timedelta64(20, "m"),
+        subsample: int = 16,
+        rng: Optional[Union[int, "np.random.Generator"]] = None,
+        require_microwave: bool = True,
+        start_time: Optional[Union[str, "np.datetime64"]] = None,
+        end_time: Optional[Union[str, "np.datetime64"]] = None,
+    ) -> Path:
+        """
+        Extract super-cell training samples anchored on per-cell reference times.
+
+        Each sample is centred on an availability cell from
+        :meth:`iter_reference_super_cells`.  Geostationary and microwave
+        observations are matched independently for every reference cell via
+        :meth:`find_slot_observations` using the cell's actual scan time as the
+        temporal anchor, avoiding per-granule approximations.
+
+        The scene covers ``scene_size × scene_size`` availability cells,
+        i.e. ``scene_size * REF_CELL`` reference pixels and
+        ``scene_size * OBS_CELL`` geo pixels per side.
+        Temporal depth is ``n_steps + 1`` slots separated by ``step``;
+        slot 0 is coincident with the reference scan time and higher slot
+        indices reach further back in time.  Frames are stored oldest-first.
+        """
+        from numcodecs.zarr3 import Blosc
+
+        output_path = Path(output_path)
+        rng = np.random.default_rng(rng)
+        frames = n_steps + 1
+        step = np.timedelta64(step)
+        ref_size = scene_size * REF_CELL
+        obs_size = scene_size * OBS_CELL
+
+        geo_satellites = list(self.geo_meta.keys())
+        mw_satellites = list(self.microwave_meta.keys())
+        geo_sensor_idx: Dict[str, int] = {s: i for i, s in enumerate(geo_satellites)}
+        mw_sensor_idx: Dict[str, int] = {s: i for i, s in enumerate(mw_satellites)}
+
+        ref_meta = self.reference_meta
+        ref_times = ref_meta["time"].values         # (n_ref, 90, 180)
+        ref_filenames = ref_meta["filename"].values
+
+        # ---- Pass 1: resolve observations for every valid reference cell ----
+        # Each reference cell may match multiple geo satellites; one scene is
+        # created per satellite so that overlapping coverage is fully utilised.
+        # scene tuple: (cell, scan_time, ref_path, geo_sat, geo_files, mw_files)
+        # geo_files[s] / mw_files[s]: Optional[Path], oldest frame first.
+        scenes: List[
+            Tuple[
+                Tuple[int, int],
+                "np.datetime64",
+                Path,
+                str,
+                List[Optional[Path]],
+                List[Optional[Path]],
+            ]
+        ] = []
+        for (row, col), scan_time in self.iter_reference_super_cells(
+            subsample=subsample, rng=rng,
+            start_time=start_time, end_time=end_time,
+        ):
+            matches = np.where(
+                ref_times[:, row, col] == np.datetime64(scan_time, "ns")
+            )[0]
+            if matches.size == 0:
+                continue
+            ref_path = self._store_path(
+                self.reference_name, str(ref_filenames[matches[0]])
+            )
+
+            # slot_obs[s]: observations for frame s (s=0 oldest, s=n_steps coincident).
+            slot_obs = [
+                self.find_slot_observations(
+                    (row, col), scan_time,
+                    slot=n_steps - s, step=step, super_cell=scene_size,
+                )
+                for s in range(frames)
+            ]
+
+            # MW: choose randomly among available sensors per frame (shared across
+            # geo variants for this reference cell).
+            mw_files: List[Optional[Path]] = [
+                obs["mw"][int(rng.integers(len(obs["mw"])))] if obs["mw"] else None
+                for obs in slot_obs
+            ]
+            if require_microwave and all(f is None for f in mw_files):
+                continue
+
+            # Collect unique geo satellites in priority order (find_slot_observations
+            # already returns them sorted by priority, so first-seen = highest priority).
+            seen_geo: set = set()
+            geo_sat_names: List[str] = []
+            for obs in slot_obs:
+                for p in obs["geo"]:
+                    n = p.parent.name
+                    if n not in seen_geo:
+                        seen_geo.add(n)
+                        geo_sat_names.append(n)
+
+            for geo_sat in geo_sat_names:
+                geo_files: List[Optional[Path]] = [
+                    next((p for p in obs["geo"] if p.parent.name == geo_sat), None)
+                    for obs in slot_obs
+                ]
+                scenes.append(
+                    ((row, col), scan_time, ref_path, geo_sat, geo_files, mw_files)
+                )
+
+        n_scenes = len(scenes)
+        LOGGER.info(
+            "Extracting %d super-cell scenes (%d step(s)) to '%s'.",
+            n_scenes, n_steps, output_path,
+        )
+        if n_scenes == 0:
+            LOGGER.warning("No scenes to extract; nothing written.")
+            return output_path
+
+        # ---- Pass 2: allocate zarr store ----
+        compressor = Blosc(cname="zstd", clevel=4)
+        store = zarr.open_group(str(output_path), mode="w")
+        store.attrs.update({
+            "geo_satellites": geo_satellites,
+            "mw_satellites": mw_satellites,
+            "scene_size": scene_size,
+            "n_steps": n_steps,
+            "step_minutes": float(step / np.timedelta64(1, "m")),
+            "ref_size": ref_size,
+            "obs_size": obs_size,
+            "resolution_ratio": RESOLUTION_RATIO,
+            "normalized": self.normalize,
+            "time_units": "nanoseconds since 1970-01-01",
+        })
+        store.create_array(
+            "geo",
+            shape=(n_scenes, N_SLOTS, frames, obs_size, obs_size),
+            chunks=(1, N_SLOTS, frames, obs_size, obs_size),
+            dtype=np.float32, fill_value=np.nan, compressors=compressor,
+            dimension_names=("scene", "geo_channel", "step", "geo_y", "geo_x"),
+        )
+        store.create_array(
+            "mw",
+            shape=(n_scenes, N_MW_SLOTS, frames, ref_size, ref_size),
+            chunks=(1, N_MW_SLOTS, frames, ref_size, ref_size),
+            dtype=np.float32, fill_value=np.nan, compressors=compressor,
+            dimension_names=("scene", "mw_channel", "step", "y", "x"),
+        )
+        store.create_array(
+            "surface_precip",
+            shape=(n_scenes, ref_size, ref_size),
+            chunks=(1, ref_size, ref_size),
+            dtype=np.float32, fill_value=np.nan, compressors=compressor,
+            dimension_names=("scene", "y", "x"),
+        )
+        store.create_array(
+            "coordinates", shape=(n_scenes, 2), dtype=np.int32,
+            dimension_names=("scene", "row_col"),
+        )
+        store.create_array(
+            "time", shape=(n_scenes,), dtype=np.int64,
+            dimension_names=("scene",),
+        )
+        store.create_array(
+            "step_time", shape=(n_scenes, frames), dtype=np.int64,
+            dimension_names=("scene", "step"),
+        )
+        store.create_array(
+            "geo_sensor", shape=(n_scenes, frames), dtype=np.int16, fill_value=-1,
+            dimension_names=("scene", "step"),
+        )
+        store.create_array(
+            "mw_sensor", shape=(n_scenes, frames), dtype=np.int16, fill_value=-1,
+            dimension_names=("scene", "step"),
+        )
+
+        # ---- Pass 3: load and write each scene ----
+        for i, ((row, col), scan_time, ref_path, geo_sat, geo_files, mw_files) in enumerate(
+            tqdm(scenes, desc="Extracting scenes", unit="scene")
+        ):
+            r0_ref = min(
+                max((row - scene_size // 2) * REF_CELL, 0),
+                N_CELLS_LAT * REF_CELL - ref_size,
+            )
+            c0_ref = min(
+                max((col - scene_size // 2) * REF_CELL, 0),
+                N_CELLS_LON * REF_CELL - ref_size,
+            )
+            r0_obs = r0_ref * RESOLUTION_RATIO
+            c0_obs = c0_ref * RESOLUTION_RATIO
+
+            store["surface_precip"][i] = self._load_reference(
+                ref_path, r0_ref, c0_ref, ref_size
+            )
+            store["coordinates"][i] = (row, col)
+            store["time"][i] = np.datetime64(scan_time, "ns").astype("int64")
+            store["step_time"][i] = np.array(
+                [
+                    (np.datetime64(scan_time, "ns") - (n_steps - s) * step).astype("int64")
+                    for s in range(frames)
+                ],
+                dtype=np.int64,
+            )
+
+            geo_scene = np.full(
+                (N_SLOTS, frames, obs_size, obs_size), np.nan, dtype=np.float32
+            )
+            mw_scene = np.full(
+                (N_MW_SLOTS, frames, ref_size, ref_size), np.nan, dtype=np.float32
+            )
+            geo_sensor_arr = np.full(frames, -1, dtype=np.int16)
+            mw_sensor_arr = np.full(frames, -1, dtype=np.int16)
+
+            for s, geo_path in enumerate(geo_files):
+                if geo_path is not None:
+                    array = self._load_obs(geo_path, r0_obs, c0_obs, obs_size)
+                    if self.normalize:
+                        array = self._normalize(array, geo_sat)
+                    geo_scene[:, s] = slot_observations(array, geo_sat)
+                    geo_sensor_arr[s] = geo_sensor_idx.get(geo_sat, -1)
+
+            for s, mw_path in enumerate(mw_files):
+                if mw_path is not None:
+                    sat_name = mw_path.parent.name
+                    array = self._load_mw_obs(mw_path, r0_ref, c0_ref, ref_size)
+                    if self.normalize:
+                        array = self._normalize(array, sat_name)
+                    mw_scene[:, s] = slot_observations(array, sat_name)
+                    mw_sensor_arr[s] = mw_sensor_idx.get(sat_name, -1)
+
+            store["geo"][i] = geo_scene
+            store["mw"][i] = mw_scene
+            store["geo_sensor"][i] = geo_sensor_arr
+            store["mw_sensor"][i] = mw_sensor_arr
+
+        LOGGER.info("Wrote %d super-cell scenes to '%s'.", n_scenes, output_path)
         return output_path
 
     # ------------------------------------------------------------------
@@ -1804,7 +2170,7 @@ class ArgosTrainingData(Dataset):
             per-pixel fields describe the microwave input: ``mw_age``, the age (in
             minutes before ``target_time``, based on the frame times) of the most
             recent microwave observation covering the pixel (``NaN`` where none),
-            and ``mw_sensor``, the index into ``microwave_sensors`` (listed in the
+            and ``mw_sensor``, the index into ``microwave_satellites`` (listed in the
             variable's ``sensors`` attribute) of the sensor that provided it
             (``-1`` where none). Where tiles overlap, the most recent observation
             wins.
@@ -1890,9 +2256,11 @@ class ArgosTrainingData(Dataset):
         # Auxiliary per-pixel fields: age (minutes before ``target_time``) and
         # sensor index of the most recent microwave observation covering a pixel.
         step_minutes = float(step / np.timedelta64(1, "m"))
-        sensor_index = {s: i for i, s in enumerate(self.microwave_sensors)}
+        sensor_index = {s: i for i, s in enumerate(self.microwave_satellites)}
         age_acc = np.full(acc.shape, np.nan, dtype=np.float32)
         sensor_acc = np.full(acc.shape, -1, dtype=np.int16)
+
+        norm_stats["goes19"] = norm_stats["goes16"]
 
         for tr0 in tqdm(row_starts, desc="Inferring tiles", unit="row"):
             for tc0 in col_starts:
@@ -1961,7 +2329,7 @@ class ArgosTrainingData(Dataset):
         )
         results.mw_sensor.attrs.update(
             full_name="Sensor of the most recent microwave observation",
-            sensors=list(self.microwave_sensors),
+            sensors=list(self.microwave_satellites),
             fill_value=-1,
         )
         return results
@@ -1990,13 +2358,14 @@ class ArgosTrainingData(Dataset):
         mw_frame_sensors: List[Optional[str]] = [None] * n_steps
         has_valid = False
 
-        # Geo: the sensor best covering the tile, nearest store to each frame.
-        geo_sensor, best_cov = None, 0
+        # Geo: satellite with the best tile coverage; priority breaks ties.
+        geo_sensor, best_cov, best_prio = None, 0, -1
         for sensor, (_, files, avail) in geo_pool.items():
             cov = avail[:, cr0:cr1, cc0:cc1].reshape(len(files), -1).sum(axis=1)
             top = int(cov.max()) if cov.size else 0
-            if top > best_cov:
-                geo_sensor, best_cov = sensor, top
+            prio = get_satellite(sensor).priority
+            if top > best_cov or (top == best_cov and prio > best_prio):
+                geo_sensor, best_cov, best_prio = sensor, top, prio
         if geo_sensor is not None:
             gtimes, gfiles, gavail = geo_pool[geo_sensor]
             covers = gavail[:, cr0:cr1, cc0:cc1].reshape(len(gfiles), -1).any(axis=1)
@@ -2094,25 +2463,27 @@ class ArgosTrainingData(Dataset):
         """
         Render the geostationary channel-to-slot assignment as an HTML table.
 
-        Rows are the :data:`N_SLOTS` spectral slots (with the slot's band name and
-        canonical wavelength) and columns are the dataset's input sensors; each
-        cell shows the sensor channel mapped to that slot (its stored index and
-        central wavelength), or a dash where the sensor has no such channel.
+        Rows are the :data:`N_SLOTS` spectral slots (with the slot's band name
+        and canonical wavelength) and columns are the dataset's input satellites;
+        each cell shows the satellite channel mapped to that slot (its stored
+        index and central wavelength), or a dash where the satellite has no such
+        channel.
 
         Returns:
             The table as an HTML string (renders in a Jupyter notebook).
         """
-        sensors = [s for s in self.input_sensors if s in CHANNEL_SLOTS]
-        cells = {sensor: ["" for _ in range(N_SLOTS)] for sensor in sensors}
-        for sensor in sensors:
-            wavelengths = SENSOR_WAVELENGTHS[sensor]
-            for channel, slot in enumerate(CHANNEL_SLOTS[sensor]):
+        satellites = [s for s in self.input_satellites if get_satellite(s).is_geo]
+        cells = {sat: ["" for _ in range(N_SLOTS)] for sat in satellites}
+        for sat_name in satellites:
+            sat = get_satellite(sat_name)
+            for channel, slot in enumerate(sat.slots):
                 if slot < 0:
                     continue
-                entry = f"ch {channel} ({wavelengths[channel]:g} &micro;m)"
-                cells[sensor][slot] = (
-                    f"{cells[sensor][slot]}<br>{entry}"
-                    if cells[sensor][slot]
+                wl = sat.channels[channel]
+                entry = f"ch {channel} ({wl:g} &micro;m)"
+                cells[sat_name][slot] = (
+                    f"{cells[sat_name][slot]}<br>{entry}"
+                    if cells[sat_name][slot]
                     else entry
                 )
         slot_columns = [
@@ -2127,7 +2498,7 @@ class ArgosTrainingData(Dataset):
             ),
         ]
         return self._slot_table_html(
-            "Geostationary channel slots", slot_columns, sensors, cells
+            "Geostationary channel slots", slot_columns, satellites, cells
         )
 
     def mw_slot_table_html(self) -> str:
@@ -2135,30 +2506,29 @@ class ArgosTrainingData(Dataset):
         Render the microwave channel-to-slot assignment as an HTML table.
 
         Rows are the :data:`N_MW_SLOTS` frequency slots (with the slot's band
-        name, frequency and polarization) and columns are the dataset's microwave
-        sensors; each cell shows the sensor channel mapped to that slot (its
-        stored index and, where available, frequency/polarization), or a dash.
+        name, frequency and polarization) and columns are the dataset's
+        microwave satellites; each cell shows the satellite channel mapped to
+        that slot (its stored index and frequency/polarization), or a dash.
 
         Returns:
             The table as an HTML string (renders in a Jupyter notebook).
         """
-        sensors = [s for s in self.microwave_sensors if s in MW_CHANNEL_SLOTS]
-        cells = {sensor: ["" for _ in range(N_MW_SLOTS)] for sensor in sensors}
-        for sensor in sensors:
-            specs = MW_SENSOR_CHANNELS[sensor]
-            for channel, slot in enumerate(MW_CHANNEL_SLOTS[sensor]):
+        satellites = [
+            s for s in self.microwave_satellites if get_satellite(s).is_mw
+        ]
+        cells = {sat: ["" for _ in range(N_MW_SLOTS)] for sat in satellites}
+        for sat_name in satellites:
+            sat = get_satellite(sat_name)
+            for channel, slot in enumerate(sat.slots):
                 if slot < 0:
                     continue
-                spec = specs[channel]
-                if isinstance(spec, tuple):
-                    freq, offset, pol = spec
-                    label = f"{freq:g}&plusmn;{offset:g}" if offset else f"{freq:g}"
-                    entry = f"ch {channel} ({label} GHz {html.escape(pol)})"
-                else:
-                    entry = f"ch {channel}"
-                cells[sensor][slot] = (
-                    f"{cells[sensor][slot]}<br>{entry}"
-                    if cells[sensor][slot]
+                ch = sat.channels[channel]
+                freq, offset, pol = ch
+                label = f"{freq:g}&plusmn;{offset:g}" if offset else f"{freq:g}"
+                entry = f"ch {channel} ({label} GHz {html.escape(pol)})"
+                cells[sat_name][slot] = (
+                    f"{cells[sat_name][slot]}<br>{entry}"
+                    if cells[sat_name][slot]
                     else entry
                 )
         slot_columns = [
@@ -2168,7 +2538,7 @@ class ArgosTrainingData(Dataset):
             ("Pol", [html.escape(pol) for _, _, pol in MW_SLOTS]),
         ]
         return self._slot_table_html(
-            "Microwave channel slots", slot_columns, sensors, cells
+            "Microwave channel slots", slot_columns, satellites, cells
         )
 
     # ------------------------------------------------------------------
