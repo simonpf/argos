@@ -1,0 +1,69 @@
+platform = "Himawari-9"
+sensor   = "AHI"
+type     = "geo"
+priority = 10
+
+# ch0 (0.455 μm) beats ch1 (0.51 μm) for slot 0; ch1 goes to the extra slot.
+[[channels]]
+wavelength = 0.455
+slot = 0
+
+[[channels]]
+wavelength = 0.51
+slot = 16
+
+[[channels]]
+wavelength = 0.645
+slot = 1
+
+[[channels]]
+wavelength = 0.86
+slot = 2
+
+[[channels]]
+wavelength = 1.61
+slot = 4
+
+[[channels]]
+wavelength = 2.26
+slot = 5
+
+[[channels]]
+wavelength = 3.85
+slot = 6
+
+[[channels]]
+wavelength = 6.25
+slot = 7
+
+[[channels]]
+wavelength = 6.95
+slot = 8
+
+[[channels]]
+wavelength = 7.3
+slot = 9
+
+[[channels]]
+wavelength = 8.6
+slot = 10
+
+[[channels]]
+wavelength = 9.63
+slot = 11
+
+[[channels]]
+wavelength = 10.45
+slot = 12
+
+[[channels]]
+wavelength = 11.2
+slot = 13
+
+[[channels]]
+wavelength = 12.3
+slot = 14
+
+[[channels]]
+wavelength = 13.3
+slot = 15

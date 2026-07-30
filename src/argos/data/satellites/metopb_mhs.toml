@@ -1,0 +1,35 @@
+platform = "MetOp-B"
+sensor   = "MHS"
+type     = "mw"
+priority = 7
+
+[[channels]]
+frequency    = 89.0
+offset       = 0.0
+polarization = "V"
+slot         = 6
+
+[[channels]]
+frequency    = 157.0
+offset       = 0.0
+polarization = "V"
+slot         = 14
+
+[[channels]]
+frequency    = 183.31
+offset       = 1.0
+polarization = "H"
+slot         = 9
+
+[[channels]]
+frequency    = 183.31
+offset       = 3.0
+polarization = "H"
+slot         = 11
+
+# 190.31 GHz = 183.31 + 7 GHz
+[[channels]]
+frequency    = 183.31
+offset       = 7.0
+polarization = "H"
+slot         = 13

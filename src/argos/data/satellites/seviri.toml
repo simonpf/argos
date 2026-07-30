@@ -1,0 +1,54 @@
+platform = "MSG"
+sensor   = "SEVIRI"
+type     = "geo"
+priority = 10
+
+# ch0 (0.75 μm) is displaced from slot 1 by ch1 (0.63 μm) and ends up in the
+# extra visible slot.
+[[channels]]
+wavelength = 0.75
+slot = 16
+
+[[channels]]
+wavelength = 0.63
+slot = 1
+
+[[channels]]
+wavelength = 0.81
+slot = 2
+
+[[channels]]
+wavelength = 1.63
+slot = 4
+
+[[channels]]
+wavelength = 3.9
+slot = 6
+
+[[channels]]
+wavelength = 6.25
+slot = 7
+
+[[channels]]
+wavelength = 7.35
+slot = 9
+
+[[channels]]
+wavelength = 8.7
+slot = 10
+
+[[channels]]
+wavelength = 9.66
+slot = 11
+
+[[channels]]
+wavelength = 10.8
+slot = 13
+
+[[channels]]
+wavelength = 12.0
+slot = 14
+
+[[channels]]
+wavelength = 13.4
+slot = 15

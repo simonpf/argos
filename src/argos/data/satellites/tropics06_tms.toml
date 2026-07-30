@@ -1,0 +1,34 @@
+platform = "TROPICS-06"
+sensor   = "TMS"
+type     = "mw"
+priority = 3
+
+[[channels]]
+frequency    = 91.655
+offset       = 0.0
+polarization = "TMS"
+slot         = 15
+
+[[channels]]
+frequency    = 184.41
+offset       = 1.1
+polarization = "H"
+slot         = 9
+
+[[channels]]
+frequency    = 186.51
+offset       = 3.2
+polarization = "H"
+slot         = 11
+
+[[channels]]
+frequency    = 190.31
+offset       = 7.0
+polarization = "H"
+slot         = 13
+
+[[channels]]
+frequency    = 204.80
+offset       = 0.0
+polarization = "H"
+slot         = 8

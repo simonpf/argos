@@ -1,0 +1,38 @@
+platform = "TROPICS-03"
+sensor   = "TMS"
+type     = "mw"
+priority = 3
+
+[[channels]]
+frequency    = 91.655
+offset       = 0.0
+polarization = "TMS"
+slot         = 15
+
+# 184.41 GHz (183.31 + 1.1 GHz) -> 183±1 slot
+[[channels]]
+frequency    = 184.41
+offset       = 1.1
+polarization = "H"
+slot         = 9
+
+# 186.51 GHz (183.31 + 3.2 GHz) -> 183±3 slot
+[[channels]]
+frequency    = 186.51
+offset       = 3.2
+polarization = "H"
+slot         = 11
+
+# 190.31 GHz (183.31 + 7.0 GHz) -> 183±7 slot
+[[channels]]
+frequency    = 190.31
+offset       = 7.0
+polarization = "H"
+slot         = 13
+
+# 204.80 GHz window channel -> 157/165 GHz slot
+[[channels]]
+frequency    = 204.80
+offset       = 0.0
+polarization = "H"
+slot         = 8

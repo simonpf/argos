@@ -1,0 +1,70 @@
+platform = "DMSP F16"
+sensor   = "SSMIS"
+type     = "mw"
+priority = 5
+
+[[channels]]
+frequency    = 19.35
+offset       = 0.0
+polarization = "V"
+slot         = 0
+
+[[channels]]
+frequency    = 19.35
+offset       = 0.0
+polarization = "H"
+slot         = 1
+
+[[channels]]
+frequency    = 22.235
+offset       = 0.0
+polarization = "V"
+slot         = 2
+
+[[channels]]
+frequency    = 37.0
+offset       = 0.0
+polarization = "V"
+slot         = 4
+
+[[channels]]
+frequency    = 37.0
+offset       = 0.0
+polarization = "H"
+slot         = 5
+
+[[channels]]
+frequency    = 150.0
+offset       = 0.0
+polarization = "H"
+slot         = 8
+
+[[channels]]
+frequency    = 183.31
+offset       = 6.6
+polarization = "H"
+slot         = 13
+
+[[channels]]
+frequency    = 183.31
+offset       = 3.0
+polarization = "H"
+slot         = 11
+
+[[channels]]
+frequency    = 183.31
+offset       = 1.0
+polarization = "H"
+slot         = 9
+
+[[channels]]
+frequency    = 91.65
+offset       = 0.0
+polarization = "V"
+slot         = 6
+
+[[channels]]
+frequency    = 91.65
+offset       = 0.0
+polarization = "H"
+slot         = 7

@@ -1,0 +1,58 @@
+platform = "Suomi NPP"
+sensor   = "ATMS"
+type     = "mw"
+priority = 9
+
+[[channels]]
+frequency    = 23.8
+offset       = 0.0
+polarization = "V"
+slot         = 2
+
+[[channels]]
+frequency    = 31.4
+offset       = 0.0
+polarization = "V"
+slot         = 3
+
+[[channels]]
+frequency    = 88.2
+offset       = 0.0
+polarization = "V"
+slot         = 6
+
+[[channels]]
+frequency    = 165.5
+offset       = 0.0
+polarization = "H"
+slot         = 8
+
+[[channels]]
+frequency    = 183.31
+offset       = 7.0
+polarization = "H"
+slot         = 13
+
+[[channels]]
+frequency    = 183.31
+offset       = 4.5
+polarization = "H"
+slot         = 12
+
+[[channels]]
+frequency    = 183.31
+offset       = 3.0
+polarization = "H"
+slot         = 11
+
+[[channels]]
+frequency    = 183.31
+offset       = 1.8
+polarization = "H"
+slot         = 10
+
+[[channels]]
+frequency    = 183.31
+offset       = 1.0
+polarization = "H"
+slot         = 9

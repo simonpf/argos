@@ -1,0 +1,68 @@
+platform = "GOES-16"
+sensor   = "ABI"
+type     = "geo"
+priority = 10
+
+[[channels]]
+wavelength = 0.47
+slot = 0
+
+[[channels]]
+wavelength = 0.64
+slot = 1
+
+[[channels]]
+wavelength = 0.86
+slot = 2
+
+[[channels]]
+wavelength = 1.37
+slot = 3
+
+[[channels]]
+wavelength = 1.6
+slot = 4
+
+[[channels]]
+wavelength = 2.2
+slot = 5
+
+[[channels]]
+wavelength = 3.9
+slot = 6
+
+[[channels]]
+wavelength = 6.2
+slot = 7
+
+[[channels]]
+wavelength = 6.9
+slot = 8
+
+[[channels]]
+wavelength = 7.3
+slot = 9
+
+[[channels]]
+wavelength = 8.4
+slot = 10
+
+[[channels]]
+wavelength = 9.6
+slot = 11
+
+[[channels]]
+wavelength = 10.3
+slot = 12
+
+[[channels]]
+wavelength = 11.2
+slot = 13
+
+[[channels]]
+wavelength = 12.3
+slot = 14
+
+[[channels]]
+wavelength = 13.3
+slot = 15
