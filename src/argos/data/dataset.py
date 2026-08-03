@@ -205,10 +205,11 @@ class _SampleIndex:
         }
         for sensor in self.sensors.tolist():
             arrays[f"fn__{sensor}"] = self.filenames[sensor]
-            stats = self.norm_stats.get(sensor)
-            if stats is not None:
-                arrays[f"nmin__{sensor}"] = stats["min"]
-                arrays[f"nmax__{sensor}"] = stats["max"]
+        if self.norm_stats:
+            arrays["norm_stat_types"] = np.array(sorted(self.norm_stats.keys()))
+            for stype, stats in self.norm_stats.items():
+                arrays[f"nmin__{stype}"] = stats["min"]
+                arrays[f"nmax__{stype}"] = stats["max"]
         np.savez_compressed(str(path), **arrays)
 
     @classmethod
@@ -218,10 +219,11 @@ class _SampleIndex:
             filenames, norm_stats = {}, {}
             for sensor in sensors.tolist():
                 filenames[sensor] = cache[f"fn__{sensor}"]
-                if f"nmin__{sensor}" in cache:
-                    norm_stats[sensor] = {
-                        "min": cache[f"nmin__{sensor}"],
-                        "max": cache[f"nmax__{sensor}"],
+            if "norm_stat_types" in cache:
+                for stype in cache["norm_stat_types"].tolist():
+                    norm_stats[stype] = {
+                        "min": cache[f"nmin__{stype}"],
+                        "max": cache[f"nmax__{stype}"],
                     }
             return cls(
                 coords=cache["coords"],
@@ -514,20 +516,35 @@ class ArgosData(Dataset):
         """
         return self.samples.norm_stats
 
+    @staticmethod
+    def _sensor_type(name: str) -> str:
+        """Sensor instrument name for a satellite instance (e.g. ``'ABI'`` for ``'goes16'``)."""
+        return get_satellite(name).sensor
+
     def _compute_normalization_stats(self) -> Dict[str, Dict[str, np.ndarray]]:
-        """Per-channel min/max from the stats files under ``.argos/stats/``."""
-        stats = {}
+        """Per-channel min/max keyed by sensor type, aggregated across all instances."""
+        type_mins: Dict[str, List[np.ndarray]] = {}
+        type_maxs: Dict[str, List[np.ndarray]] = {}
         for sensor in (*self.input_satellites, *self.microwave_satellites):
             ds = self._read_stats(sensor)
             if ds is None or "obs_min" not in ds:
                 continue
-            # A channel that was never observed yields an all-NaN slice (and a
-            # NaN stat); :meth:`_normalize` passes such channels through.
+            stype = self._sensor_type(sensor)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
-                stats[sensor] = {
-                    "min": np.nanmin(ds["obs_min"].values, axis=0),
-                    "max": np.nanmax(ds["obs_max"].values, axis=0),
+                type_mins.setdefault(stype, []).append(
+                    np.nanmin(ds["obs_min"].values, axis=0)
+                )
+                type_maxs.setdefault(stype, []).append(
+                    np.nanmax(ds["obs_max"].values, axis=0)
+                )
+        stats = {}
+        for stype in type_mins:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                stats[stype] = {
+                    "min": np.nanmin(type_mins[stype], axis=0),
+                    "max": np.nanmax(type_maxs[stype], axis=0),
                 }
         return stats
 
@@ -713,7 +730,7 @@ class ArgosData(Dataset):
         """Path of the on-disk sample-index cache under ``.argos/``."""
         key = "|".join(
             [
-                "v2",  # cache format version (bump to invalidate old caches)
+                "v3",  # cache format version (bump to invalidate old caches)
                 ",".join(self.input_satellites),
                 ",".join(self.microwave_satellites),
                 self.reference_name,
@@ -1263,7 +1280,7 @@ class ArgosData(Dataset):
 
     def _normalize(self, array: np.ndarray, sensor: str) -> np.ndarray:
         """Scale a sensor's ``(channel, ...)`` observations to ``[-1, 1]``."""
-        stats = self.normalization_stats.get(sensor)
+        stats = self.normalization_stats.get(self._sensor_type(sensor))
         if stats is None:
             return array
         return self._scale_to_unit(array, stats)
@@ -2260,8 +2277,6 @@ class ArgosData(Dataset):
         age_acc = np.full(acc.shape, np.nan, dtype=np.float32)
         sensor_acc = np.full(acc.shape, -1, dtype=np.int16)
 
-        norm_stats["goes19"] = norm_stats["goes16"]
-
         for tr0 in tqdm(row_starts, desc="Inferring tiles", unit="row"):
             for tc0 in col_starts:
                 geo_scene, mw_scene, mw_frame_sensors, has_valid = (
@@ -2378,7 +2393,7 @@ class ArgosData(Dataset):
                 array = self._load_obs(
                     self._store_path(geo_sensor, gfiles[k]), obs_r0, obs_c0, obs_size
                 )
-                stats = norm_stats.get(geo_sensor)
+                stats = norm_stats.get(self._sensor_type(geo_sensor))
                 if stats is not None:
                     array = self._scale_to_unit(array, stats)
                 geo_scene[:, s] = slot_observations(array, geo_sensor)
@@ -2405,7 +2420,7 @@ class ArgosData(Dataset):
             array = self._load_mw_obs(
                 self._store_path(sensor, filename), tr0, tc0, tile
             )
-            stats = norm_stats.get(sensor)
+            stats = norm_stats.get(self._sensor_type(sensor))
             if stats is not None:
                 array = self._scale_to_unit(array, stats)
             mw_scene[:, s] = slot_observations(array, sensor)
