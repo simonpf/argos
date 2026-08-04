@@ -27,10 +27,12 @@ The availability and time fields of every file are read up front so that
 suitable, temporally-matched samples can be enumerated without touching the
 (large) observation arrays.
 """
+from concurrent.futures import ProcessPoolExecutor
 from functools import cached_property
 import hashlib
 import html
 import logging
+import multiprocessing
 from pathlib import Path
 import re
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
@@ -957,20 +959,26 @@ class ArgosData(Dataset):
         avail = ref["availability"].values.astype(bool)  # (n_files, 90, 180)
         times = ref["time"].values                        # (n_files, 90, 180)
 
-        for f in range(avail.shape[0]):
-            valid = avail[f] & ~np.isnat(times[f])
-            if t_start is not None:
-                valid &= times[f] >= t_start
-            if t_end is not None:
-                valid &= times[f] <= t_end
-            rows, cols = np.where(valid)
-            if rows.size == 0:
-                continue
-            if subsample > 1:
-                keep = rng.random(rows.size) < (1.0 / subsample)
-                rows, cols = rows[keep], cols[keep]
-            for r, c in zip(rows.tolist(), cols.tolist()):
-                yield (r, c), times[f, r, c]
+        valid = avail & ~np.isnat(times)
+        if t_start is not None:
+            valid &= times >= t_start
+        if t_end is not None:
+            valid &= times <= t_end
+
+        fs, rows, cols = np.where(valid)
+        if fs.size == 0:
+            return
+        if subsample > 1:
+            keep = rng.random(fs.size) < (1.0 / subsample)
+            fs, rows, cols = fs[keep], rows[keep], cols[keep]
+
+        for f, r, c in tqdm(
+            zip(fs.tolist(), rows.tolist(), cols.tolist()),
+            desc="Iterating reference super-cells",
+            total=fs.size,
+            unit="cell",
+        ):
+            yield (r, c), times[f, r, c]
 
     def find_slot_observations(
         self,
@@ -1831,6 +1839,7 @@ class ArgosData(Dataset):
         require_microwave: bool = True,
         start_time: Optional[Union[str, "np.datetime64"]] = None,
         end_time: Optional[Union[str, "np.datetime64"]] = None,
+        workers: int = 1,
     ) -> Path:
         """
         Extract super-cell training samples anchored on per-cell reference times.
@@ -1871,30 +1880,28 @@ class ArgosData(Dataset):
         # created per satellite so that overlapping coverage is fully utilised.
         # scene tuple: (cell, scan_time, ref_path, geo_sat, geo_files, mw_files)
         # geo_files[s] / mw_files[s]: Optional[Path], oldest frame first.
-        scenes: List[
-            Tuple[
-                Tuple[int, int],
-                "np.datetime64",
-                Path,
-                str,
-                List[Optional[Path]],
-                List[Optional[Path]],
-            ]
-        ] = []
-        for (row, col), scan_time in self.iter_reference_super_cells(
+
+        all_cells = list(self.iter_reference_super_cells(
             subsample=subsample, rng=rng,
             start_time=start_time, end_time=end_time,
-        ):
+        ))
+        # Pre-spawn one child RNG per cell so workers are independent.
+        child_rngs = rng.spawn(len(all_cells))
+
+        def _match_cell(
+            cell_scan_time: Tuple[Tuple[int, int], "np.datetime64"],
+            cell_rng: "np.random.Generator",
+        ) -> List[Tuple]:
+            (row, col), scan_time = cell_scan_time
             matches = np.where(
                 ref_times[:, row, col] == np.datetime64(scan_time, "ns")
             )[0]
             if matches.size == 0:
-                continue
+                return []
             ref_path = self._store_path(
                 self.reference_name, str(ref_filenames[matches[0]])
             )
 
-            # slot_obs[s]: observations for frame s (s=0 oldest, s=n_steps coincident).
             slot_obs = [
                 self.find_slot_observations(
                     (row, col), scan_time,
@@ -1903,17 +1910,13 @@ class ArgosData(Dataset):
                 for s in range(frames)
             ]
 
-            # MW: choose randomly among available sensors per frame (shared across
-            # geo variants for this reference cell).
             mw_files: List[Optional[Path]] = [
-                obs["mw"][int(rng.integers(len(obs["mw"])))] if obs["mw"] else None
+                obs["mw"][int(cell_rng.integers(len(obs["mw"])))] if obs["mw"] else None
                 for obs in slot_obs
             ]
             if require_microwave and all(f is None for f in mw_files):
-                continue
+                return []
 
-            # Collect unique geo satellites in priority order (find_slot_observations
-            # already returns them sorted by priority, so first-seen = highest priority).
             seen_geo: set = set()
             geo_sat_names: List[str] = []
             for obs in slot_obs:
@@ -1923,14 +1926,26 @@ class ArgosData(Dataset):
                         seen_geo.add(n)
                         geo_sat_names.append(n)
 
+            result = []
             for geo_sat in geo_sat_names:
                 geo_files: List[Optional[Path]] = [
                     next((p for p in obs["geo"] if p.parent.name == geo_sat), None)
                     for obs in slot_obs
                 ]
-                scenes.append(
+                result.append(
                     ((row, col), scan_time, ref_path, geo_sat, geo_files, mw_files)
                 )
+            return result
+
+        scenes: List[Tuple] = []
+        mp_context = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=mp_context) as executor:
+            futures = [
+                executor.submit(_match_cell, cell_scan_time, child_rng)
+                for cell_scan_time, child_rng in zip(all_cells, child_rngs)
+            ]
+            for future in tqdm(futures, desc="Matching observations", unit="cell"):
+                scenes.extend(future.result())
 
         n_scenes = len(scenes)
         LOGGER.info(
