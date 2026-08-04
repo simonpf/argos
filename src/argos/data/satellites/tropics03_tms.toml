@@ -12,21 +12,21 @@ slot         = 15
 # 184.41 GHz (183.31 + 1.1 GHz) -> 183±1 slot
 [[channels]]
 frequency    = 184.41
-offset       = 1.1
+offset       = 0.0
 polarization = "H"
 slot         = 9
 
 # 186.51 GHz (183.31 + 3.2 GHz) -> 183±3 slot
 [[channels]]
 frequency    = 186.51
-offset       = 3.2
+offset       = 0.0
 polarization = "H"
 slot         = 11
 
 # 190.31 GHz (183.31 + 7.0 GHz) -> 183±7 slot
 [[channels]]
 frequency    = 190.31
-offset       = 7.0
+offset       = 0.0
 polarization = "H"
 slot         = 13
 

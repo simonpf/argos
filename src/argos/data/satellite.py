@@ -43,7 +43,7 @@ SLOT_NAMES: Tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 # Canonical microwave slot definitions
 # ---------------------------------------------------------------------------
-N_MW_SLOTS = 16
+N_MW_SLOTS = 15
 
 # Canonical microwave slots: (frequency [GHz], 183-GHz offset [GHz], pol class).
 MW_SLOTS: Tuple[Tuple[float, float, str], ...] = (

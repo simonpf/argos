@@ -13,23 +13,23 @@ slot         = 6
 frequency    = 157.0
 offset       = 0.0
 polarization = "V"
-slot         = 14
+slot         = 8
 
 [[channels]]
 frequency    = 183.31
 offset       = 1.0
 polarization = "H"
-slot         = 9
+slot         = 10
 
 [[channels]]
 frequency    = 183.31
 offset       = 3.0
 polarization = "H"
-slot         = 11
+slot         = 12
 
 # 190.31 GHz = 183.31 + 7 GHz
 [[channels]]
-frequency    = 183.31
-offset       = 7.0
+frequency    = 190.31
+offset       = 0.0
 polarization = "H"
-slot         = 13
+slot         = 14

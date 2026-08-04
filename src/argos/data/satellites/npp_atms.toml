@@ -25,34 +25,34 @@ slot         = 6
 frequency    = 165.5
 offset       = 0.0
 polarization = "H"
-slot         = 8
+slot         = 9
 
 [[channels]]
 frequency    = 183.31
 offset       = 7.0
 polarization = "H"
-slot         = 13
+slot         = 14
 
 [[channels]]
 frequency    = 183.31
 offset       = 4.5
 polarization = "H"
-slot         = 12
+slot         = 13
 
 [[channels]]
 frequency    = 183.31
 offset       = 3.0
 polarization = "H"
-slot         = 11
+slot         = 12
 
 [[channels]]
 frequency    = 183.31
 offset       = 1.8
 polarization = "H"
-slot         = 10
+slot         = 11
 
 [[channels]]
 frequency    = 183.31
 offset       = 1.0
 polarization = "H"
-slot         = 9
+slot         = 10

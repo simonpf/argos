@@ -1016,7 +1016,6 @@ class ArgosData(Dataset):
         ref = self.reference_meta
         avail = ref["availability"].values.astype(bool)  # (n_files, 90, 180)
         times = ref["time"].values                        # (n_files, 90, 180)
-
         valid = avail & ~np.isnat(times)
         if t_start is not None:
             valid &= times >= t_start
