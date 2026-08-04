@@ -77,6 +77,64 @@ from argos.data.satellite import (  # noqa: E402
 )
 
 
+def _match_cell(
+    dataset: "TrainingDataset",
+    cell_scan_time: Tuple[Tuple[int, int], "np.datetime64"],
+    cell_rng: "np.random.Generator",
+    ref_times: "np.ndarray",
+    ref_filenames: "np.ndarray",
+    n_steps: int,
+    frames: int,
+    step: "np.timedelta64",
+    scene_size: int,
+    require_microwave: bool,
+) -> List[Tuple]:
+    (row, col), scan_time = cell_scan_time
+    matches = np.where(
+        ref_times[:, row, col] == np.datetime64(scan_time, "ns")
+    )[0]
+    if matches.size == 0:
+        return []
+    ref_path = dataset._store_path(
+        dataset.reference_name, str(ref_filenames[matches[0]])
+    )
+
+    slot_obs = [
+        dataset.find_slot_observations(
+            (row, col), scan_time,
+            slot=n_steps - s, step=step, super_cell=scene_size,
+        )
+        for s in range(frames)
+    ]
+
+    mw_files: List[Optional[Path]] = [
+        obs["mw"][int(cell_rng.integers(len(obs["mw"])))] if obs["mw"] else None
+        for obs in slot_obs
+    ]
+    if require_microwave and all(f is None for f in mw_files):
+        return []
+
+    seen_geo: set = set()
+    geo_sat_names: List[str] = []
+    for obs in slot_obs:
+        for p in obs["geo"]:
+            n = p.parent.name
+            if n not in seen_geo:
+                seen_geo.add(n)
+                geo_sat_names.append(n)
+
+    result = []
+    for geo_sat in geo_sat_names:
+        geo_files: List[Optional[Path]] = [
+            next((p for p in obs["geo"] if p.parent.name == geo_sat), None)
+            for obs in slot_obs
+        ]
+        result.append(
+            ((row, col), scan_time, ref_path, geo_sat, geo_files, mw_files)
+        )
+    return result
+
+
 def slot_observations(
     obs: np.ndarray, satellite: str, fill: float = np.nan
 ) -> np.ndarray:
@@ -1840,6 +1898,7 @@ class ArgosData(Dataset):
         start_time: Optional[Union[str, "np.datetime64"]] = None,
         end_time: Optional[Union[str, "np.datetime64"]] = None,
         workers: int = 1,
+        position_jitter: int = REF_CELL,
     ) -> Path:
         """
         Extract super-cell training samples anchored on per-cell reference times.
@@ -1888,60 +1947,16 @@ class ArgosData(Dataset):
         # Pre-spawn one child RNG per cell so workers are independent.
         child_rngs = rng.spawn(len(all_cells))
 
-        def _match_cell(
-            cell_scan_time: Tuple[Tuple[int, int], "np.datetime64"],
-            cell_rng: "np.random.Generator",
-        ) -> List[Tuple]:
-            (row, col), scan_time = cell_scan_time
-            matches = np.where(
-                ref_times[:, row, col] == np.datetime64(scan_time, "ns")
-            )[0]
-            if matches.size == 0:
-                return []
-            ref_path = self._store_path(
-                self.reference_name, str(ref_filenames[matches[0]])
-            )
-
-            slot_obs = [
-                self.find_slot_observations(
-                    (row, col), scan_time,
-                    slot=n_steps - s, step=step, super_cell=scene_size,
-                )
-                for s in range(frames)
-            ]
-
-            mw_files: List[Optional[Path]] = [
-                obs["mw"][int(cell_rng.integers(len(obs["mw"])))] if obs["mw"] else None
-                for obs in slot_obs
-            ]
-            if require_microwave and all(f is None for f in mw_files):
-                return []
-
-            seen_geo: set = set()
-            geo_sat_names: List[str] = []
-            for obs in slot_obs:
-                for p in obs["geo"]:
-                    n = p.parent.name
-                    if n not in seen_geo:
-                        seen_geo.add(n)
-                        geo_sat_names.append(n)
-
-            result = []
-            for geo_sat in geo_sat_names:
-                geo_files: List[Optional[Path]] = [
-                    next((p for p in obs["geo"] if p.parent.name == geo_sat), None)
-                    for obs in slot_obs
-                ]
-                result.append(
-                    ((row, col), scan_time, ref_path, geo_sat, geo_files, mw_files)
-                )
-            return result
-
         scenes: List[Tuple] = []
         mp_context = multiprocessing.get_context("fork")
         with ProcessPoolExecutor(max_workers=workers, mp_context=mp_context) as executor:
             futures = [
-                executor.submit(_match_cell, cell_scan_time, child_rng)
+                executor.submit(
+                    _match_cell,
+                    self, cell_scan_time, child_rng,
+                    ref_times, ref_filenames,
+                    n_steps, frames, step, scene_size, require_microwave,
+                )
                 for cell_scan_time, child_rng in zip(all_cells, child_rngs)
             ]
             for future in tqdm(futures, desc="Matching observations", unit="cell"):
@@ -2017,12 +2032,14 @@ class ArgosData(Dataset):
         for i, ((row, col), scan_time, ref_path, geo_sat, geo_files, mw_files) in enumerate(
             tqdm(scenes, desc="Extracting scenes", unit="scene")
         ):
+            dr = int(rng.integers(-position_jitter, position_jitter + 1)) if position_jitter > 0 else 0
+            dc = int(rng.integers(-position_jitter, position_jitter + 1)) if position_jitter > 0 else 0
             r0_ref = min(
-                max((row - scene_size // 2) * REF_CELL, 0),
+                max((row - scene_size // 2) * REF_CELL + dr, 0),
                 N_CELLS_LAT * REF_CELL - ref_size,
             )
             c0_ref = min(
-                max((col - scene_size // 2) * REF_CELL, 0),
+                max((col - scene_size // 2) * REF_CELL + dc, 0),
                 N_CELLS_LON * REF_CELL - ref_size,
             )
             r0_obs = r0_ref * RESOLUTION_RATIO
