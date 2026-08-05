@@ -2668,11 +2668,18 @@ class ArgosDataset(Dataset):
     Dataset of pre-extracted training scenes.
 
     Loads the fixed-size, slotted scenes written by
-    :meth:`ArgosTrainingData.extract_samples`. Each item is the same
-    ``(inputs, target)`` tuple a model consumes -- ``inputs`` holding the ``geo``
-    and ``mw`` tensors (and the tile ``coordinates``) and ``target`` the
-    ``surface_precip`` tensor. Absent inputs are kept as ``NaN`` so the keys are
-    always present (and batch cleanly); the model treats them as zeros.
+    :meth:`ArgosData.extract_samples` or :meth:`ArgosData.extract_super_cell_samples`.
+    Accepts either a path to a single ``.zarr`` store or a directory containing
+    multiple ``.zarr`` stores; in the latter case all stores are concatenated into
+    one logical dataset. Each item is the same ``(inputs, target)`` tuple a model
+    consumes -- ``inputs`` holding the ``geo`` and ``mw`` tensors (and the tile
+    ``coordinates``) and ``target`` the ``surface_precip`` tensor. Absent inputs
+    are kept as ``NaN`` so the keys are always present (and batch cleanly); the
+    model treats them as zeros.
+
+    When a temporal step dimension is present its size-1 case is collapsed: if
+    ``geo`` or ``mw`` are 4-D with a step axis of length 1, that axis is squeezed
+    so the model sees the same 3-D shape as scenes without temporal context.
 
     With ``augment=True`` a random affine transform (rotation, isotropic scaling
     and shear) is drawn per item and applied identically to ``geo``, ``mw`` and
@@ -2690,7 +2697,9 @@ class ArgosDataset(Dataset):
     ):
         """
         Args:
-            path: Path of a ``.zarr`` store written by ``extract_samples``.
+            path: Path of a ``.zarr`` store written by ``extract_samples``, or a
+                directory containing multiple such stores (all ``.zarr`` entries
+                found by glob are loaded and concatenated).
             augment: If ``True``, apply a random affine augmentation to each item.
             rotation: Range (degrees) for the random rotation.
             scale: Range for the random isotropic scale factor.
@@ -2703,22 +2712,45 @@ class ArgosDataset(Dataset):
         self.scale = scale
         self.shear = shear
 
+        # Discover store paths: single store or all *.zarr in a directory.
+        p = self.path
+        if p.suffix == ".zarr" or (p / ".zgroup").exists():
+            self._store_paths: List[Path] = [p]
+        else:
+            self._store_paths = sorted(p.glob("*.zarr"))
+            if not self._store_paths:
+                raise FileNotFoundError(f"No .zarr stores found in '{p}'.")
+
+        # Per-file sample counts and cumulative offsets for global index mapping.
+        # Open briefly (just for shape metadata) before workers are forked.
+        lengths = [
+            zarr.open_group(str(sp), mode="r")["surface_precip"].shape[0]
+            for sp in self._store_paths
+        ]
+        self._file_lengths: List[int] = lengths
+        self._cumlen: np.ndarray = np.concatenate([[0], np.cumsum(lengths)])
+
     # ``DataLoader(worker_init_fn=...)`` helper to seed NumPy per worker (the
     # augmentation uses ``numpy.random``).
     worker_init_fn = staticmethod(worker_init_fn)
 
     @cached_property
+    def _stores(self) -> List["zarr.Group"]:
+        """Lazily opened zarr stores, one per file (opened per process for fork safety)."""
+        return [zarr.open_group(str(p), mode="r") for p in self._store_paths]
+
+    @property
     def store(self) -> "zarr.Group":
-        """The (lazily opened) zarr store, opened per process for fork safety."""
-        return zarr.open_group(str(self.path), mode="r")
+        """The first zarr store (backward-compatible single-store accessor)."""
+        return self._stores[0]
 
     @property
     def sensors(self) -> List[str]:
         """The sensor names indexed by ``geo_sensor``/``mw_sensor``."""
-        return list(self.store.attrs.get("sensors", []))
+        return list(self._stores[0].attrs.get("sensors", []))
 
     def __len__(self) -> int:
-        return self.store["surface_precip"].shape[0]
+        return int(self._cumlen[-1])
 
     def _sample_affine_params(self) -> Dict[str, object]:
         """Draw random affine parameters (rotation, scale, x/y shear)."""
@@ -2758,11 +2790,21 @@ class ArgosDataset(Dataset):
         return out.reshape(shape)
 
     def __getitem__(self, index: int) -> Tuple[Dict[str, object], torch.Tensor]:
-        store = self.store
-        coords = np.asarray(store["coordinates"][index])
-        geo = torch.from_numpy(np.asarray(store["geo"][index]))
-        mw = torch.from_numpy(np.asarray(store["mw"][index]))
-        target = torch.from_numpy(np.asarray(store["surface_precip"][index]))
+        file_idx = int(np.searchsorted(self._cumlen[1:], index, side="right"))
+        local_idx = index - int(self._cumlen[file_idx])
+        store = self._stores[file_idx]
+
+        coords = np.asarray(store["coordinates"][local_idx])
+        geo = torch.from_numpy(np.asarray(store["geo"][local_idx]))
+        mw = torch.from_numpy(np.asarray(store["mw"][local_idx]))
+        target = torch.from_numpy(np.asarray(store["surface_precip"][local_idx]))
+
+        # Collapse a size-1 temporal step axis so that single-frame stores produce
+        # the same (channel, H, W) shape as non-temporal ones.
+        if geo.ndim == 4 and geo.shape[1] == 1:
+            geo = geo.squeeze(1)
+        if mw.ndim == 4 and mw.shape[1] == 1:
+            mw = mw.squeeze(1)
 
         # Skip samples without any valid reference data by falling back to a
         # randomly drawn sample.
