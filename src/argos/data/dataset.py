@@ -2296,9 +2296,13 @@ class ArgosData(Dataset):
         # inference does not need the (reference-granule) sample index.
         norm_stats = self._compute_normalization_stats() if self.normalize else {}
 
-        # Hann blending window (with a floor so lone-tile edges keep full weight).
-        taper = np.hanning(tile + 2)[1:-1].astype(np.float64)
-        window = np.outer(taper, taper) + 1e-3
+        # Trapezoidal blending window: linear ramp over the overlap region, flat (1.0) in the interior.
+        taper = np.ones(tile, dtype=np.float64)
+        if overlap > 0:
+            ramp = np.linspace(0.0, 1.0, overlap + 1)[1:]
+            taper[:overlap] = ramp
+            taper[tile - overlap:] = ramp[::-1]
+        window = np.outer(taper, taper)
 
         acc = np.zeros((r_end - r_start, c_end - c_start), dtype=np.float64)
         wgt = np.zeros_like(acc)
@@ -2694,6 +2698,7 @@ class ArgosDataset(Dataset):
         rotation: Tuple[float, float] = (-180.0, 180.0),
         scale: Tuple[float, float] = (0.8, 1.2),
         shear: Tuple[float, float] = (-15.0, 15.0),
+        fraction: float = 1.0,
     ):
         """
         Args:
@@ -2704,6 +2709,9 @@ class ArgosDataset(Dataset):
             rotation: Range (degrees) for the random rotation.
             scale: Range for the random isotropic scale factor.
             shear: Range (degrees) for the random x/y shear.
+            fraction: Fraction of all samples to expose per epoch, in ``(0, 1]``
+                (default 1.0 = all).  Call :meth:`resample` at the start of each
+                epoch to draw a fresh random subset.
         """
         super().__init__()
         self.path = Path(path)
@@ -2711,6 +2719,9 @@ class ArgosDataset(Dataset):
         self.rotation = rotation
         self.scale = scale
         self.shear = shear
+        if not 0.0 < fraction <= 1.0:
+            raise ValueError("fraction must be in (0, 1].")
+        self.fraction = float(fraction)
 
         # Discover store paths: single store or all *.zarr in a directory.
         p = self.path
@@ -2721,14 +2732,27 @@ class ArgosDataset(Dataset):
             if not self._store_paths:
                 raise FileNotFoundError(f"No .zarr stores found in '{p}'.")
 
-        # Per-file sample counts and cumulative offsets for global index mapping.
-        # Open briefly (just for shape metadata) before workers are forked.
-        lengths = [
-            zarr.open_group(str(sp), mode="r")["surface_precip"].shape[0]
-            for sp in self._store_paths
-        ]
+        # Per-file sample counts, cumulative offsets, and valid-sample index.
+        # Open briefly (just for metadata) before workers are forked.
+        lengths: List[int] = []
+        valid: List[int] = []
+        offset = 0
+        for sp in self._store_paths:
+            s = zarr.open_group(str(sp), mode="r")
+            n = s["surface_precip"].shape[0]
+            lengths.append(n)
+            geo_s = np.asarray(s["geo_sensor"][:])   # (n,) or (n, frames)
+            mw_s = np.asarray(s["mw_sensor"][:])
+            has_geo = (geo_s >= 0).reshape(n, -1).any(axis=1)
+            has_mw = (mw_s >= 0).reshape(n, -1).any(axis=1)
+            valid.extend((offset + np.where(has_geo & has_mw)[0]).tolist())
+            offset += n
         self._file_lengths: List[int] = lengths
         self._cumlen: np.ndarray = np.concatenate([[0], np.cumsum(lengths)])
+        self._valid_indices: np.ndarray = np.array(valid, dtype=np.int64)
+        self._active_indices: Optional[np.ndarray] = None
+        if self.fraction < 1.0:
+            self.resample()
 
     # ``DataLoader(worker_init_fn=...)`` helper to seed NumPy per worker (the
     # augmentation uses ``numpy.random``).
@@ -2749,8 +2773,16 @@ class ArgosDataset(Dataset):
         """The sensor names indexed by ``geo_sensor``/``mw_sensor``."""
         return list(self._stores[0].attrs.get("sensors", []))
 
+    def resample(self) -> None:
+        """Draw a new random subset of :attr:`fraction` samples for the next epoch."""
+        n_valid = len(self._valid_indices)
+        n = max(1, round(self.fraction * n_valid))
+        self._active_indices = np.random.choice(n_valid, size=n, replace=False)
+
     def __len__(self) -> int:
-        return int(self._cumlen[-1])
+        if self._active_indices is not None:
+            return len(self._active_indices)
+        return len(self._valid_indices)
 
     def _sample_affine_params(self) -> Dict[str, object]:
         """Draw random affine parameters (rotation, scale, x/y shear)."""
@@ -2790,6 +2822,9 @@ class ArgosDataset(Dataset):
         return out.reshape(shape)
 
     def __getitem__(self, index: int) -> Tuple[Dict[str, object], torch.Tensor]:
+        if self._active_indices is not None:
+            index = int(self._active_indices[index])
+        index = int(self._valid_indices[index])
         file_idx = int(np.searchsorted(self._cumlen[1:], index, side="right"))
         local_idx = index - int(self._cumlen[file_idx])
         store = self._stores[file_idx]
