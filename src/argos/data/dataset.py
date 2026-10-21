@@ -467,6 +467,8 @@ class ArgosData(Dataset):
         return np.array(offsets)[:, None, None] + obs
 
 
+
+
     def load_mw_obs(
             self,
             path: Path,
@@ -869,6 +871,54 @@ class ArgosData(Dataset):
                         mode="a",
                         encoding=encoding,
                     )
+
+    def load_input_data(
+            self,
+            time,
+            bounds: Tuple[float, float, float, float]=(-180., -90.0, 180.0, 90.0),
+            n_steps: int = 0
+    ):
+        lon_min, lat_min, lon_max, lat_max = bounds
+        ref_meta = self.reference_meta
+
+        lon_mask = (lon_min <= ref_meta.longitude) * (ref_meta.longitude <= lon_max)
+        lon_inds = np.where(lon_mask.data)[0]
+        lon_start = lon_inds[0]
+        lon_end = max(0, lon_inds[-1] - 1)
+
+        lat_mask = (lat_min <= ref_meta.latitude) * (ref_meta.latitude <= lat_max)
+        lat_inds = np.where(lat_mask.data)[0]
+        lat_start = lat_inds[0]
+        lat_end = max(0, lat_inds[-1] - 1)
+
+        times = time + 2.0 * self.time_window * np.arange(0, n_steps + 1)
+        time_max = times[0] + self.time_window
+        time_min = times[-1] - self.time_window
+
+        obs_geo = []
+        obs_mw = []
+
+        mw_meta = {}
+        lon_slc = slice(lon_start, lon_end)
+        lat_slc = slice(lat_start, lat_end)
+        for sat, data in self.microwave_meta.items():
+            inds = (start_ref < data.time_max) * (data.time_min < end_ref)
+            data = data[{"samples": inds, "lon_cell": lon_slc, "lat_cell": lat_slc}]
+            mw_meta[sat] = data
+
+        geo_avail = []
+        for geo_sat in self.input_satellites:
+            geo_data = self.geo_meta[geo_sat]
+            geo_slice = (
+                ((times[0] - self.time_window)) < geo_data.time.data) *
+                (geo_data.time.data < (times[0] + self.time_window))
+            )
+            geo_data = geo_data[{"samples": geo_slice, "lon_cell": lon_slc, "lat_cell": lat_slc}]
+            geo_avail.append(geo_data[{"samples": 0}].availability.data.sum())
+
+        return np.array(geo_avail)
+
+
 
 
 
