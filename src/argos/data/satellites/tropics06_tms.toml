@@ -7,7 +7,7 @@ priority = 3
 frequency    = 91.655
 offset       = 0.0
 polarization = "TMS"
-slot         = 15
+slot         = 7
 
 [[channels]]
 frequency    = 184.41

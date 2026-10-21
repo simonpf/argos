@@ -32,6 +32,7 @@ from functools import cached_property
 import hashlib
 import html
 import logging
+from math import trunc
 import multiprocessing
 from pathlib import Path
 import re
@@ -412,6 +413,465 @@ class ArgosData(Dataset):
             )
         return {self.reference_name: files}
 
+    def load_target_precip(
+            self,
+            sample_ind: int,
+            cell_ind_row: int,
+            cell_ind_col: int,
+            size: int
+    ):
+        meta = self.reference_meta
+        filename = meta.filename.data[sample_ind]
+        lat_slc = slice(
+            REF_CELL * (cell_ind_row - size // 2),
+            REF_CELL * (cell_ind_row + size // 2)
+        )
+        lon_slc = slice(
+            REF_CELL * (cell_ind_col - size // 2),
+            REF_CELL * (cell_ind_col + size // 2)
+
+        )
+        store =  zarr.open(self.path / self.reference_name  / filename, mode="r")
+        ref = np.array(store["surface_precip"][lat_slc, lon_slc])
+        scale = float(store.attrs.get("scale_factor", 0.02))
+        fill = store.attrs.get("fill_value", -1)
+        ref_f = ref.astype(np.float32) * scale
+        ref_f[ref == fill] = np.nan
+        return ref_f
+
+
+    def load_geo_obs(
+            self,
+            path: Path,
+            cell_ind_row: int,
+            cell_ind_col: int,
+            size: int
+    ):
+        lat_slc = slice(
+            OBS_CELL * (cell_ind_row - size // 2),
+            OBS_CELL * (cell_ind_row + size // 2)
+        )
+        lon_slc = slice(
+            OBS_CELL * (cell_ind_col - size // 2),
+            OBS_CELL * (cell_ind_col + size // 2)
+
+        )
+        store =  zarr.open(path)
+        obs = np.array(store["obs"][:, lat_slc, lon_slc])
+
+        fval = store.attrs["fill_value"]
+        offsets = store.attrs["offsets"]
+        mask = obs == fval
+        obs = obs.astype(np.float32)
+        obs[mask] = np.nan
+        return np.array(offsets)[:, None, None] + obs
+
+
+    def load_mw_obs(
+            self,
+            path: Path,
+            cell_ind_row: int,
+            cell_ind_col: int,
+            size: int
+    ):
+        lat_slc = slice(
+            REF_CELL * (cell_ind_row - size // 2),
+            REF_CELL * (cell_ind_row + size // 2)
+        )
+        lon_slc = slice(
+            REF_CELL * (cell_ind_col - size // 2),
+            REF_CELL * (cell_ind_col + size // 2)
+
+        )
+        store =  zarr.open(path)
+        obs = np.array(store["obs"][:, lat_slc, lon_slc])
+
+        fval = store.attrs["fill_value"]
+        mask = obs == fval
+        obs = obs.astype(np.float32)
+        obs[mask] = np.nan
+
+        return obs
+
+
+    def extract_matches_geo_mw(
+            self,
+            ref_ind: int,
+            subsample: int = 10,
+            n_steps: int = 8,
+    ) -> xr.Dataset:
+
+        ref_data = self.reference_meta[{"samples": ref_ind}]
+        ref_time = ref_data.time.data
+        ref_time = ref_time[np.isfinite(ref_time)]
+
+        time_step = 2.0 * self.time_window
+        start_ref = ref_time.min() - (n_steps + 1) * time_step
+        end_ref = ref_time.max()
+
+        samples = []
+
+        mw_meta = {}
+        for sat, data in self.microwave_meta.items():
+            inds = (start_ref < data.time_max) * (data.time_min < end_ref)
+            data = data[{"samples": inds}]
+            mw_meta[sat] = data
+
+
+        for geo_sat in self.input_satellites:
+
+            geo_data = self.geo_meta[geo_sat]
+            geo_slice = (
+                ((start_ref - np.timedelta64(10, "m")) < geo_data.time.data) *
+                (geo_data.time.data < (end_ref + np.timedelta64(10, "m")))
+            )
+            geo_data = geo_data[{"samples": geo_slice}]
+
+            d_t = (geo_data.time - ref_data.time).data
+            valid = geo_data.availability.data * (np.abs(d_t) < np.timedelta64(10, "m"))
+            valid_geo = np.stack([data.availability.data.any(0) for data in mw_meta.values()]).sum(0)
+            valid = valid * valid_geo
+            cells = list(zip(*np.where(valid)))
+            sze = 4
+            cells = [
+                cell for cell in cells
+                if sze // 2 <= cell[1] and cell[1] <= N_CELLS_LAT - sze // 2
+                and sze // 2 <= cell[2] and cell[2] <= N_CELLS_LON - sze // 2
+                and 15 < cell[1] and cell[1] < 75
+            ]
+
+            cell_inds = np.random.choice(np.arange(len(cells)), len(cells) // subsample, replace=False)
+            cells = [cells[ind] for ind in cell_inds]
+
+
+            for cell_ind, cell in enumerate(cells):
+
+                lat_slc = slice(cell[1] - sze // 2, cell[1] + sze // 2)
+                lon_slc = slice(cell[2] - sze // 2, cell[2] + sze // 2)
+                mw_meta_c = {
+                    name: data[{"lat_cell": lat_slc, "lon_cell": lon_slc}]
+                    for name, data in mw_meta.items()
+                }
+
+                obs_geo = []
+                obs_mw = []
+                time_geo = []
+                time_mw = []
+
+                for step in range(0, n_steps + 1):
+
+                    slot_time = ref_data.time.data[cell[1:]] - step * time_step
+                    slot_min = slot_time - self.time_window
+                    slot_max = slot_time + self.time_window
+
+                    d_t = np.abs(geo_data.time.data - slot_time)
+                    geo_ind = np.argmin(d_t)
+                    if d_t[geo_ind] < self.time_window:
+                        geo_file = geo_data.filename.data[geo_ind]
+                        geo_time = geo_data.time.data[geo_ind]
+                        obs = self.load_geo_obs(self.path / geo_sat / geo_file, *cell[1:], 4)
+                        obs = slot_observations(obs, geo_sat)
+                    else:
+                        obs = np.nan * np.zeros_like(obs_geo[-1])
+
+                    obs_geo.append(obs)
+                    time_geo.append(geo_time)
+
+                    M, N = obs.shape[1:]
+                    obs_mw_s = np.nan * np.zeros((15, M // 2, N // 2))
+                    mw_time = np.datetime64("NAT", "ns")
+
+                    for mw_sat, data in mw_meta_c.items():
+
+                        d_t = np.abs(slot_time - data.time.data)
+                        mw_inds = np.where(d_t < self.time_window)[0]
+                        if len(mw_inds) == 0:
+                            continue
+                        slot_data = data[{"samples": mw_inds[0]}]
+                        mw_file = slot_data.filename.data
+                        slot_times = slot_data.time.data
+                        mw_time = slot_times[np.isfinite(slot_times)][0]
+                        obs_s = slot_observations(
+                            self.load_mw_obs(self.path / mw_sat / mw_file, *cell[1:], 4),
+                            mw_sat
+                        )
+                        new = np.isnan(obs_mw_s) * np.isfinite(obs_s)
+                        obs_mw_s[new] = obs_s[new]
+
+                    time_mw.append(mw_time)
+                    obs_mw.append(obs_mw_s)
+
+
+                obs_geo = np.stack(obs_geo, axis=1)
+                obs_mw = np.stack(obs_mw, axis=1)
+                targ = self.load_target_precip(ref_ind, cell[1], cell[2], 4)
+                sample = xr.Dataset({
+                    "obs_geo": (("channels_geo", "time", "y_geo", "x_geo"), obs_geo),
+                    "obs_mw": (("channels_mw", "time", "y", "x"), obs_mw),
+                    "time_mw": (("time"), np.array(time_mw).astype("datetime64[s]")),
+                    "time_geo": (("time"), np.array(time_geo).astype("datetime64[s]")),
+                    "surface_precip": (("y", "x"), targ),
+                })
+                samples.append(sample)
+
+        if len(samples) == 0:
+            return None
+
+        return xr.concat(samples, dim="samples")
+
+
+    def extract_matches(self, ref_ind: int, subsample: int = 10) -> xr.Dataset:
+
+        ref_data = self.reference_meta[{"samples": ref_ind}]
+        ref_time = ref_data.time.data
+        ref_time = ref_time[np.isfinite(ref_time)]
+        start_ref = ref_time.min()
+        end_ref = ref_time.max()
+
+        samples = []
+
+        for geo_sat in self.input_satellites:
+            geo_data = self.geo_meta[geo_sat]
+            geo_slice = (
+                ((start_ref - np.timedelta64(10, "m")) < geo_data.time.data) *
+                (geo_data.time.data < (end_ref + np.timedelta64(10, "m")))
+            )
+            geo_data = geo_data[{"samples": geo_slice}]
+            d_t = (geo_data.time - ref_data.time).data
+            valid = geo_data.availability.data * (np.abs(d_t) < np.timedelta64(10, "m"))
+            cells = list(zip(*np.where(valid)))
+            sze = 6
+            cells = [
+                cell for cell in cells
+                if sze // 2 <= cell[1] and cell[1] <= N_CELLS_LAT - sze // 2
+                and sze // 2 <= cell[2] and cell[2] <= N_CELLS_LON - sze // 2
+                and 15 < cell[1] and cell[1] < 75
+            ]
+
+            cell_inds = np.random.choice(np.arange(len(cells)), len(cells) // subsample, replace=False)
+            cells = [cells[ind] for ind in cell_inds]
+
+
+            for cell_ind, cell in enumerate(cells):
+                geo_file = geo_data.filename.data[cell[0]]
+                obs = self.load_geo_obs(self.path / geo_sat / geo_file, *cell[1:], 4)
+                targ = self.load_target_precip(ref_ind, cell[1], cell[2], 4)
+                obs = slot_observations(obs, geo_sat)
+                sample = xr.Dataset({
+                    "obs_geo": (("channels_geo", "y_geo", "x_geo"), obs),
+                    "surface_precip": (("y", "x"), targ),
+                    "time_lag": d_t[*cell]
+                })
+                samples.append(sample)
+
+        if len(samples) == 0:
+            return None
+
+        return xr.concat(samples, dim="samples")
+
+    def extract_training_data_geo(
+            self,
+            output_path: Path,
+            start_time: np.datetime64,
+            end_time: np.datetime64,
+            include_mw: bool = False,
+            subsample: int = 10,
+    ):
+        from numcodecs.zarr3 import Blosc
+        output_path = Path(output_path)
+
+        compressor = Blosc(cname="zstd", clevel=4)
+        encoding = {
+            "obs_geo": {
+                "chunks": (1, 16, 320, 320),
+                "dtype": "float32",
+                "compressor": compressor
+            },
+            "surface_precip":  {
+                "chunks": (1, 160, 160),
+                "dtype": "float32",
+                "compressor": compressor
+            },
+        }
+        if include_mw:
+            encoding["obs_mw"] = {
+                "chunks": (1, 17, 160, 160),
+                "dtype": "float32",
+                "compressor": compressor
+            }
+            encoding["time_geo"] = {
+                "dtype": "float32"
+            }
+            encoding["time_mw"] = {
+                "dtype": "float32"
+            }
+        ref_meta = self.reference_meta
+        ref_time = ref_meta.time
+        in_range = (start_time <= ref_time) * (ref_time < end_time)
+        ref_inds = sorted(list(np.unique(np.where(in_range.data)[0])))
+
+        for ref_ind in tqdm(ref_inds, "Extracting Training Samples"):
+            if include_mw:
+                samples = self.extract_matches_geo_mw(ref_ind, subsample=subsample)
+                if samples is not None:
+                    has_mw = np.isfinite(samples.obs_mw).any(("channels_mw", "time", "y", "x"))
+                    samples = samples[{"samples": has_mw}]
+            else:
+                samples = self.extract_matches(ref_ind, subsample=subsample)
+
+            if samples is not None:
+                if output_path.exists():
+                    samples.to_zarr(
+                        output_path,
+                        mode="a",
+                        append_dim="samples"
+                    )
+                else:
+                    samples.to_zarr(
+                        output_path,
+                        mode="a",
+                        encoding=encoding,
+                    )
+
+
+    def extract_matches_mw(self, ref_ind: int, subsample: int = 10) -> xr.Dataset:
+
+        ref_data = self.reference_meta[{"samples": ref_ind}]
+        ref_time = ref_data.time.data
+        ref_time = ref_time[np.isfinite(ref_time)]
+        start_ref = ref_time.min() - self.time_window
+        end_ref = ref_time.max() + self.time_window
+
+        samples = []
+
+        for mw_sat in self.microwave_meta:
+
+            mw_data = self.microwave_meta[mw_sat]
+
+            time_min = mw_data.time_min
+            time_max = mw_data.time_max
+            inds = (start_ref <= time_max) * (time_min <= end_ref)
+            mw_data = mw_data[{"samples": inds}]
+
+            d_t = (mw_data.time - ref_data.time).data
+            valid_mw = mw_data.availability.data * (np.abs(d_t) < self.time_window)
+            mw_cells = list(zip(*np.where(valid_mw)))
+            sze = 4
+            mw_cells = {
+                (cell[1], cell[2]): cell[0] for cell in mw_cells
+                if sze // 2 <= cell[1] and cell[1] <= N_CELLS_LAT - sze // 2
+                and sze // 2 <= cell[2] and cell[2] <= N_CELLS_LON - sze // 2
+                and 15 < cell[1] and cell[1] < 75
+            }
+
+            if len(mw_cells) == 0:
+                continue
+
+
+            for geo_sat in self.geo_meta:
+                geo_data = self.geo_meta[geo_sat]
+                d_t = (geo_data.time - ref_data.time)
+                inds = (start_ref <= geo_data.time) * (geo_data.time <= end_ref)
+                geo_data = geo_data[{"samples": inds}]
+
+                d_t = geo_data.time - ref_data.time
+                valid_geo = geo_data.availability.data * (np.abs(d_t) < self.time_window)
+
+                geo_cells = list(zip(*np.where(valid_geo)))
+                geo_cells = [
+                    cell for cell in geo_cells
+                    if (cell[1], cell[2]) in mw_cells
+                ]
+                cell_inds = np.random.choice(
+                    np.arange(len(geo_cells)),
+                    max(len(geo_cells) // subsample, min(1, len(geo_cells))),
+                    replace=False
+                )
+                geo_cells = [geo_cells[ind] for ind in cell_inds]
+
+
+                for cell_ind, geo_cell in enumerate(geo_cells):
+                    mw_ind = mw_cells[(geo_cell[1], geo_cell[2])]
+                    mw_file = mw_data.filename.data[mw_ind]
+                    obs_mw = slot_observations(
+                        self.load_mw_obs(self.path / mw_sat / mw_file, *geo_cell[1:], 4),
+                        mw_sat
+                    )
+                    valid_mw = np.isfinite(obs_mw).mean((-2, -1)).max()
+
+                    geo_file = geo_data.filename.data[geo_cell[0]]
+                    obs_geo = slot_observations(
+                        self.load_geo_obs(self.path / geo_sat / geo_file, *geo_cell[1:], 4),
+                        geo_sat
+                    )
+                    valid_geo = np.isfinite(obs_geo).mean((-2, -1)).max()
+
+                    if (valid_mw < 0.5) and (valid_geo < 0.5):
+                        continue
+
+                    targ = self.load_target_precip(ref_ind, geo_cell[1], geo_cell[2], 4)
+                    sample = xr.Dataset({
+                        "obs_geo": (("channels_geo", "y_geo", "x_geo"), obs_geo),
+                        "obs_mw": (("channels_mw", "y", "x"), obs_mw),
+                        "surface_precip": (("y", "x"), targ),
+                        "time_lag": d_t[*geo_cell]
+                    })
+                    samples.append(sample)
+
+        if len(samples) == 0:
+            return None
+
+        return xr.concat(samples, dim="samples")
+
+    def extract_training_data_mw(
+            self,
+            output_path: Path,
+            start_time: np.datetime64,
+            end_time: np.datetime64
+    ):
+        from numcodecs.zarr3 import Blosc
+        output_path = Path(output_path)
+
+        compressor = Blosc(cname="zstd", clevel=4)
+        encoding = {
+            "obs_geo": {
+                "chunks": (1, 16, 320, 320),
+                "dtype": "float32",
+                "compressor": compressor
+            },
+            "obs_mw":  {
+                "chunks": (1, 15, 160, 160),
+                "dtype": "float32",
+                "compressor": compressor
+            },
+            "surface_precip":  {
+                "chunks": (1, 160, 160),
+                "dtype": "float32",
+                "compressor": compressor
+            },
+        }
+        ref_meta = self.reference_meta
+        ref_time = ref_meta.time
+        in_range = (start_time <= ref_time) * (ref_time < end_time)
+        ref_inds = sorted(list(np.unique(np.where(in_range.data)[0])))
+        for ref_ind in tqdm(ref_inds, "Extracting Training Samples"):
+            samples = self.extract_matches_mw(ref_ind)
+            if samples is not None:
+                if output_path.exists():
+                    samples.to_zarr(
+                        output_path,
+                        mode="a",
+                        append_dim="samples"
+                    )
+                else:
+                    samples.to_zarr(
+                        output_path,
+                        mode="a",
+                        encoding=encoding,
+                    )
+
+
+
     # ------------------------------------------------------------------
     # Metadata loading
     # ------------------------------------------------------------------
@@ -444,6 +904,13 @@ class ArgosData(Dataset):
                 self._write_stats(name, meta)
             else:
                 meta = self._read_index(name)
+
+            if "lat_cell" in meta.time.dims:
+                time_min = meta.time.min(("lat_cell", "lon_cell"), skipna=True)
+                time_max = meta.time.max(("lat_cell", "lon_cell"), skipna=True)
+                meta["time_min"] = time_min
+                meta["time_max"] = time_max
+
             if meta is not None and meta.sizes["samples"] > 0:
                 indices[name] = meta.drop_vars(
                     ["obs_min", "obs_max"], errors="ignore"
@@ -1837,7 +2304,6 @@ class ArgosData(Dataset):
                 ref_r0, ref_c0, self.tile_size,
             )
             store["coordinates"][i] = (row_c, col_c)
-            print("TIMES :: ", slot_time, sample_times[index].astype("int64"))
             store["time"][i] = sample_times[index].astype("int64")
             store["geo_sensor"][i] = geo_col
             store["step_time"][i] = np.array(
@@ -1945,21 +2411,18 @@ class ArgosData(Dataset):
         ))
         # Pre-spawn one child RNG per cell so workers are independent.
         child_rngs = rng.spawn(len(all_cells))
+        rng = np.random.default_rng()
 
         scenes: List[Tuple] = []
         mp_context = multiprocessing.get_context("fork")
-        with ProcessPoolExecutor(max_workers=workers, mp_context=mp_context) as executor:
-            futures = [
-                executor.submit(
-                    _match_cell,
-                    self, cell_scan_time, child_rng,
+        for cell_scan_time, child_rng in zip(all_cells, child_rngs):
+            scenes.extend(
+                _match_cell(
+                    self, cell_scan_time, rng,
                     ref_times, ref_filenames,
                     n_steps, frames, step, scene_size, require_microwave,
                 )
-                for cell_scan_time, child_rng in zip(all_cells, child_rngs)
-            ]
-            for future in tqdm(futures, desc="Matching observations", unit="cell"):
-                scenes.extend(future.result())
+            )
 
         n_scenes = len(scenes)
         LOGGER.info(
@@ -2665,6 +3128,254 @@ class ArgosData(Dataset):
         fig.tight_layout()
         return fig
 
+class ArgosSimpleDataset(Dataset):
+    """
+    A stripped down Argos training dataset.
+    """
+
+    def __init__(
+        self,
+        path: Union[str, Path],
+        validation: bool = False,
+        sampling_rate: float = 1.0,
+        channel_dropout: float = 0.1,
+        sensor_dropout: float = 0.2,
+    ):
+        """
+        Args:
+            path: Path of a ``.zarr`` store written by ``extract_samples``, or a
+                directory containing multiple such stores (all ``.zarr`` entries
+                found by glob are loaded and concatenated).
+            validation: If ``True``, disable random offset randomisation so
+                the same deterministic subset is used every time.  Has no effect
+                when ``fraction == 1.0``.
+        """
+        super().__init__()
+        self.path = Path(path)
+        self.sampling_rate = sampling_rate
+        self.store = zarr.open(self.path, mode="r")
+        self.validation = validation
+        self.rng = np.random.default_rng()
+        self.channel_dropout = channel_dropout
+        self.sensor_dropout = sensor_dropout
+
+
+    def worker_init_fn(self, worker_id: int) -> None:
+        """
+        Seed NumPy's global RNG for a ``DataLoader`` worker.
+
+        The dataset uses ``numpy.random`` for the random center jitter and sensor
+        selection in :meth:`ArgosTrainingData.__getitem__`. Forked workers would
+        otherwise inherit the same RNG state and produce identical random draws, so
+        pass this as the ``worker_init_fn`` of a ``torch.utils.data.DataLoader``::
+
+            DataLoader(dataset, num_workers=4, worker_init_fn=worker_init_fn)
+
+        Each worker is seeded from its (already worker-distinct) torch seed, so draws
+        differ across workers and across epochs.
+        """
+        self.rng = np.random.default_rng(torch.initial_seed() % (2**32))
+
+    def __len__(self) -> int:
+        return trunc(self.sampling_rate * self.store["obs_geo"].shape[0])
+
+    def __getitem__(self, index: int) -> Tuple[Dict[str, object], torch.Tensor]:
+
+        lower = trunc(index / self.sampling_rate)
+        upper = trunc((index + 1) / self.sampling_rate)
+        if lower < upper:
+            index = self.rng.integers(lower, upper)
+        else:
+            index = lower
+
+        obs_geo = torch.tensor(np.array(self.store["obs_geo"][index]).astype(np.float32))
+        if "obs_mw" in list(self.store):
+            obs_mw = torch.tensor(np.array(self.store["obs_mw"][index]).astype(np.float32))
+        else:
+            obs_mw = torch.zeros((15,) + obs_geo[0, ::2, ::2].shape)
+        surface_precip = torch.tensor(np.array(self.store["surface_precip"][index]).astype(np.float32))
+
+        if not self.validation:
+            n_chans_geo = obs_geo.shape[0]
+            geo_drop = torch.tensor(self.rng.random(n_chans_geo) < self.channel_dropout)
+            obs_geo[geo_drop] = torch.nan
+
+            n_chans_mw = obs_mw.shape[0]
+            mw_drop = torch.tensor(self.rng.random(n_chans_mw) < self.channel_dropout)
+            obs_mw[mw_drop] = torch.nan
+
+            drop_sensor = self.rng.random() < self.sensor_dropout
+            if drop_sensor:
+                if self.rng.random() < 0.5:
+                    obs_geo[:] = torch.nan
+                else:
+                    obs_mw[:] = torch.nan
+
+        if not self.validation:
+            angle = self.rng.uniform(-90, 90)
+            scale = self.rng.uniform(0.9, 1.1)
+            transform = lambda tensor: tv_functional.affine(
+                tensor[None],
+                angle=angle,
+                translate=[0, 0],
+                scale=scale,
+                shear=[0, 0],
+                fill=torch.nan,
+            )[0]
+            obs_geo = transform(obs_geo)
+            obs_mw = transform(obs_mw)
+            surface_precip = transform(surface_precip)
+
+        valid_ref = torch.isfinite(surface_precip)
+        valid_mw = torch.any(torch.isfinite(obs_mw), 0)
+        valid_geo = torch.any(torch.isfinite(obs_geo), 0)
+        M, N = valid_geo.shape
+        valid_geo = valid_geo.reshape((M // 2, 2, N // 2, 2)).any((1, 3))
+
+        if self.validation:
+            surface_precip[~valid_geo] = torch.nan
+
+        valid = (valid_ref * (valid_geo + valid_mw)).to(dtype=torch.float32).sum()
+        n_valid = valid.sum()
+        if n_valid < 50:
+            LOGGER.warning(
+                "Less then 50 valid pixels in scene %s. Falling back to randomly chosen "
+                "sample.",
+                n_valid
+            )
+            new_ind = self.rng.integers(len(self))
+            return self[new_ind]
+
+        inputs = {
+            "geo": obs_geo,
+            "mw": obs_mw
+        }
+        return inputs, surface_precip
+
+
+class ArgosMultiDataset(Dataset):
+    """
+    A stripped down Argos training dataset.
+    """
+
+    def __init__(
+        self,
+        path: Union[str, Path],
+        validation: bool = False,
+        sampling_rate: float = 1.0,
+        channel_dropout: float = 0.1,
+        sensor_dropout: float = 0.2,
+    ):
+        """
+        Args:
+            path: Path of a ``.zarr`` store written by ``extract_samples``, or a
+                directory containing multiple such stores (all ``.zarr`` entries
+                found by glob are loaded and concatenated).
+            validation: If ``True``, disable random offset randomisation so
+                the same deterministic subset is used every time.  Has no effect
+                when ``fraction == 1.0``.
+        """
+        super().__init__()
+        self.path = Path(path)
+        self.sampling_rate = sampling_rate
+        self.store = zarr.open(self.path, mode="r")
+        self.validation = validation
+        self.rng = np.random.default_rng()
+        self.channel_dropout = channel_dropout
+        self.sensor_dropout = sensor_dropout
+
+
+    def worker_init_fn(self, worker_id: int) -> None:
+        """
+        Seed NumPy's global RNG for a ``DataLoader`` worker.
+
+        The dataset uses ``numpy.random`` for the random center jitter and sensor
+        selection in :meth:`ArgosTrainingData.__getitem__`. Forked workers would
+        otherwise inherit the same RNG state and produce identical random draws, so
+        pass this as the ``worker_init_fn`` of a ``torch.utils.data.DataLoader``::
+
+            DataLoader(dataset, num_workers=4, worker_init_fn=worker_init_fn)
+
+        Each worker is seeded from its (already worker-distinct) torch seed, so draws
+        differ across workers and across epochs.
+        """
+        self.rng = np.random.default_rng(torch.initial_seed() % (2**32))
+
+    def __len__(self) -> int:
+        return trunc(self.sampling_rate * self.store["obs_geo"].shape[0])
+
+    def __getitem__(self, index: int) -> Tuple[Dict[str, object], torch.Tensor]:
+
+        lower = trunc(index / self.sampling_rate)
+        upper = trunc((index + 1) / self.sampling_rate)
+        if lower < upper:
+            index = self.rng.integers(lower, upper)
+        else:
+            index = lower
+
+        obs_geo = torch.tensor(np.array(self.store["obs_geo"][index]).astype(np.float32))
+        if "obs_mw" in list(self.store):
+            obs_mw = torch.tensor(np.array(self.store["obs_mw"][index]).astype(np.float32))
+        else:
+            obs_mw = torch.zeros((15,) + obs_geo[0, ::2, ::2].shape)
+        surface_precip = torch.tensor(np.array(self.store["surface_precip"][index]).astype(np.float32))
+
+        if not self.validation:
+            n_chans_geo = obs_geo.shape[0]
+            geo_drop = torch.tensor(self.rng.random(n_chans_geo) < self.channel_dropout)
+            obs_geo[geo_drop] = torch.nan
+
+            n_chans_mw = obs_mw.shape[0]
+            mw_drop = torch.tensor(self.rng.random(n_chans_mw) < self.channel_dropout)
+            obs_mw[mw_drop] = torch.nan
+
+            drop_sensor = self.rng.random() < self.sensor_dropout
+            if drop_sensor:
+                if self.rng.random() < 0.5:
+                    obs_geo[:] = torch.nan
+                else:
+                    obs_mw[:] = torch.nan
+
+        if not self.validation:
+            angle = self.rng.uniform(-90, 90)
+            scale = self.rng.uniform(0.9, 1.1)
+            transform = lambda tensor: tv_functional.affine(
+                tensor[None],
+                angle=angle,
+                translate=[0, 0],
+                scale=scale,
+                shear=[0, 0],
+                fill=torch.nan,
+            )[0]
+            obs_geo = transform(obs_geo)
+            obs_mw = transform(obs_mw)
+            surface_precip = transform(surface_precip)
+
+        valid_ref = torch.isfinite(surface_precip)
+        valid_mw = torch.any(torch.any(torch.isfinite(obs_mw), 0), 0)
+        valid_geo = torch.any(torch.any(torch.isfinite(obs_geo), 0), 0)
+        M, N = valid_geo.shape
+        valid_geo = valid_geo.reshape((M // 2, 2, N // 2, 2)).any((1, 3))
+
+        if self.validation:
+            surface_precip[~valid_geo] = torch.nan
+
+        valid = (valid_ref * (valid_geo + valid_mw)).to(dtype=torch.float32).sum()
+        n_valid = valid.sum()
+        if n_valid < 50:
+            LOGGER.warning(
+                "Less then 50 valid pixels in scene %s. Falling back to randomly chosen "
+                "sample.",
+                n_valid
+            )
+            new_ind = self.rng.integers(len(self))
+            return self[new_ind]
+
+        inputs = {
+            "geo": obs_geo,
+            "mw": obs_mw
+        }
+        return inputs, surface_precip
 
 class ArgosDataset(Dataset):
     """
