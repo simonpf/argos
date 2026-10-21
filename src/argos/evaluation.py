@@ -129,7 +129,6 @@ def evaluate_model(
     target_key: str = "surface_precip",
     geo_only: bool = False,
     mw_sensors: Optional[List[int]] = None,
-    drop_mw: Optional[int] = None
 ) -> xr.Dataset:
     """
     Evaluate a trained model against the scenes of an :class:`ArgosDataset`.
@@ -164,11 +163,14 @@ def evaluate_model(
         a 2-D grid with a ``step`` dimension and a ``sensor`` dimension of sensor
         names.
     """
-    allowed_sensors = (
-        None
-        if mw_sensors is None
-        else np.array(sorted({int(s) for s in mw_sensors}), dtype=np.int64)
-    )
+    lags = None
+    allowed_sensors = None
+    if isinstance(mw_sensors, list):
+        allowed_sensors = np.array(sorted({int(s) for s in mw_sensors}), dtype=np.int64)
+        lags = None
+    elif isinstance(mw_sensors, dict):
+        allowed_sensors = np.array(sorted({int(s) for s in mw_sensors.keys()}), dtype=np.int64)
+        lags = mw_sensors
 
     if device is None:
         try:
@@ -202,25 +204,29 @@ def evaluate_model(
         stop = min(start + batch_size, n_scenes)
         geo = np.asarray(store["geo"][start:stop])
         mw = np.array(store["mw"][start:stop])  # writable: nulled in place below
+        mw_orig = mw.copy()
         target_np = np.asarray(store[target_key][start:stop])
         mw_sensor = np.asarray(store["mw_sensor"][start:stop])
 
-        # Optionally drop microwave observations before they reach the model and
-        # the conditioning fields (both derived from ``mw`` below).
+        # Only use allowed MW sensors.
         if allowed_sensors is not None:
             drop = ~np.isin(mw_sensor, allowed_sensors)  # (b,) or (b, step)
             if temporal:
                 mw[np.broadcast_to(drop[:, None, :, None, None], mw.shape)] = np.nan
+                mw_orig[np.broadcast_to(drop[:, None, :, None, None], mw.shape)] = np.nan
             else:
                 mw[drop] = np.nan
-
-        mw_orig = mw.copy()
+                mw_orig[drop] = np.nan
 
         if geo_only:
             mw[:] = np.nan
 
-        if drop_mw is not None:
-            mw[:drop_mw] = np.nan
+        if temporal and lags is not None:
+            step = np.flip(np.arange(mw.shape[2]))
+            for sensor, lag in lags.items():
+                drop = (mw_sensor == sensor) * (step < lag)
+                mw[np.broadcast_to(drop[:, None, :, None, None], mw.shape)] = np.nan
+                print("DROPPED :: ", sensor, " :: ", drop.sum())
 
         inpt = {
             "geo": torch.from_numpy(geo).to(device),

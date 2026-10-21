@@ -467,8 +467,6 @@ class ArgosData(Dataset):
         return np.array(offsets)[:, None, None] + obs
 
 
-
-
     def load_mw_obs(
             self,
             path: Path,
@@ -872,6 +870,7 @@ class ArgosData(Dataset):
                         encoding=encoding,
                     )
 
+
     def load_input_data(
             self,
             time,
@@ -910,14 +909,13 @@ class ArgosData(Dataset):
         for geo_sat in self.input_satellites:
             geo_data = self.geo_meta[geo_sat]
             geo_slice = (
-                ((times[0] - self.time_window)) < geo_data.time.data) *
+                ((times[0] - self.time_window) < geo_data.time.data) *
                 (geo_data.time.data < (times[0] + self.time_window))
             )
             geo_data = geo_data[{"samples": geo_slice, "lon_cell": lon_slc, "lat_cell": lat_slc}]
             geo_avail.append(geo_data[{"samples": 0}].availability.data.sum())
 
         return np.array(geo_avail)
-
 
 
 
