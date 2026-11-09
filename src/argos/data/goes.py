@@ -99,7 +99,11 @@ def get_goes_lonlats(
 _RESAMPLE_INFO = {}
 
 
-def get_resample_info_cached(dataset: xr.Dataset, domain):
+def get_resample_info_cached(
+        dataset: xr.Dataset,
+        domain,
+        radius_of_influence=5e3
+):
     """
     Cached calculation of resampling info.
 
@@ -123,7 +127,7 @@ def get_resample_info_cached(dataset: xr.Dataset, domain):
         _RESAMPLE_INFO[key] = get_resample_info(
             dataset,
             domain,
-            radius_of_influence=5e3
+            radius_of_influence=radius_of_influence
         )
     return _RESAMPLE_INFO[key]
 
@@ -220,7 +224,7 @@ class GOESObs:
                 data["latitude"] = (("y", "x"), lats)
                 data["longitude"] = (("y", "x"), lons)
 
-                resample_info = get_resample_info_cached(data, grid)
+                resample_info = get_resample_info_cached(data, grid, radius_of_influence=15e3)
 
                 for chan in range(1, 17):
 
